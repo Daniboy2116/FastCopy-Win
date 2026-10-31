@@ -23,7 +23,8 @@ Ambas copias con el origen en caché y verificadas: mismos archivos y mismos byt
 - **Copia en paralelo** (hasta 8 archivos a la vez) y **sin caché** para archivos de más de 256 MB.
 - **Mover seguro entre discos:** copia, **verifica byte a byte** y solo entonces borra el original. Si algo falla, el original se queda donde estaba.
 - **Mover dentro del mismo disco** es un renombrado instantáneo, como en Windows.
-- **Ventana de progreso** estilo Windows 11 (tema claro/oscuro, color de acento) con velocidad, tiempo restante, **Pausar/Reanudar** y **Cancelar**, y progreso en el icono de la barra de tareas. Solo aparece si la operación dura más de medio segundo.
+- **Ventana de progreso** estilo Windows 11 (tema claro/oscuro, color de acento) con velocidad, tiempo restante, botones de icono para **pausar/reanudar** y **cancelar** cada operación, y progreso en el icono de la barra de tareas. Solo aparece si la operación dura más de medio segundo.
+- **Varias operaciones en una sola ventana**, como en Windows: un panel por copia o movimiento, que entra y sale con animación.
 - **Más detalles:** la barra de progreso se transforma en una gráfica de velocidad de toda la operación (con media y máxima), y aparecen elementos procesados y restantes, datos, tiempo transcurrido y restante, y la ruta. Recuerda si lo dejaste abierto. Las animaciones respetan la opción "Efectos de animación" de Windows.
 - **Si no lo tiene claro, se lo deja a Windows.** Antes de escribir nada, FastCopy planifica toda la operación. Si encuentra algo que no maneja, no toca nada y la copia la hace Windows como siempre:
   - conflictos de nombre (sale el diálogo normal de "Reemplazar u omitir"),
@@ -129,7 +130,6 @@ Lee esto antes de instalarlo:
 - **Se ejecuta código dentro del Explorador.** Un fallo en la DLL puede cerrar el Explorador. Windows lo reinicia solo y el agente vuelve a cargar FastCopy, pero puede pasar.
 - **Antivirus y Smart App Control.** Cargar una DLL en otro proceso es una técnica que también usa el malware. Defender no lo bloqueó en las pruebas, pero otros antivirus o Smart App Control en modo "Activado" podrían hacerlo, porque los binarios no están firmados.
 - **El `Ctrl+Z` del Explorador no deshace** las copias y movimientos que hizo FastCopy.
-- **Varias copias a la vez** abren cada una su propia ventana, en lugar de agruparse como en Windows.
 - **Solo comprobado en una máquina.** Por ahora, los datos importantes: con copia de seguridad.
 
 FastCopy está diseñado para no perder datos: nunca borra un original de un movimiento sin haber verificado la copia byte a byte, y ante cualquier duda deja la operación en manos de Windows.
@@ -154,7 +154,6 @@ uninstall.ps1      lo quita todo
 
 ## Pendiente
 
-- Una sola ventana para varias operaciones a la vez.
 - Rutas de más de 260 caracteres (ahora las copia Windows).
 - Resolver conflictos de nombre dentro de FastCopy (ahora los resuelve Windows).
 - Verificación también en copias (ahora solo se verifica al mover).
