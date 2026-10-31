@@ -24,6 +24,7 @@ Ambas copias con el origen en caché y verificadas: mismos archivos y mismos byt
 - **Mover seguro entre discos:** copia, **verifica byte a byte** y solo entonces borra el original. Si algo falla, el original se queda donde estaba.
 - **Mover dentro del mismo disco** es un renombrado instantáneo, como en Windows.
 - **Ventana de progreso** estilo Windows 11 (tema claro/oscuro, color de acento) con velocidad, tiempo restante, **Pausar/Reanudar** y **Cancelar**, y progreso en el icono de la barra de tareas. Solo aparece si la operación dura más de medio segundo.
+- **Más detalles:** la barra de progreso se transforma en una gráfica de velocidad de toda la operación (con media y máxima), y aparecen elementos procesados y restantes, datos, tiempo transcurrido y restante, y la ruta. Recuerda si lo dejaste abierto. Las animaciones respetan la opción "Efectos de animación" de Windows.
 - **Si no lo tiene claro, se lo deja a Windows.** Antes de escribir nada, FastCopy planifica toda la operación. Si encuentra algo que no maneja, no toca nada y la copia la hace Windows como siempre:
   - conflictos de nombre (sale el diálogo normal de "Reemplazar u omitir"),
   - rutas de red, móviles, ZIP y otras carpetas virtuales,
@@ -153,7 +154,6 @@ uninstall.ps1      lo quita todo
 
 ## Pendiente
 
-- Hover en los botones de la ventana de progreso.
 - Una sola ventana para varias operaciones a la vez.
 - Rutas de más de 260 caracteres (ahora las copia Windows).
 - Resolver conflictos de nombre dentro de FastCopy (ahora los resuelve Windows).
