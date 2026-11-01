@@ -207,25 +207,42 @@ static BOOL ResolveConflicts(Plan *p, FcProgress *prog)
 {
     if (!p->nconf)
         return TRUE;
+    PCWSTR *srcs = malloc(p->nconf * sizeof(PCWSTR)), *dsts = malloc(p->nconf * sizeof(PCWSTR));
+    volatile LONG *picks = malloc(p->nconf * sizeof(LONG));
+    int k = 0;
+    for (int i = 0; i < p->n; i++)
+        if (p->v[i].conflict) {
+            srcs[k] = p->v[i].src;
+            dsts[k] = p->v[i].dst;
+            picks[k++] = FC_CONFLICT_BOTH;  // nothing is lost unless the answer says so
+        }
+    prog->conflictSrc = srcs;
+    prog->conflictDst = dsts;
+    prog->conflictPick = picks;
     FcConflictChoice c = prog->onConflict(prog, p->nconf, p->firstConf);
-    if (c == FC_CONFLICT_CANCEL)
-        return FALSE;
-    for (int i = 0; i < p->n; i++) {
+    prog->conflictSrc = prog->conflictDst = NULL;
+    prog->conflictPick = NULL;
+    BOOL cancelled = c == FC_CONFLICT_CANCEL;
+    for (int i = 0, n = 0; i < p->n && !cancelled; i++) {
         Job *j = &p->v[i];
         if (!j->conflict)
             continue;
-        if (c == FC_CONFLICT_SKIP) {
+        FcConflictChoice cj = c == FC_CONFLICT_EACH ? (FcConflictChoice)picks[n++] : c;
+        if (cj == FC_CONFLICT_SKIP) {
             j->kind = J_SKIP;
-        } else if (c == FC_CONFLICT_BOTH) {
+        } else if (cj == FC_CONFLICT_REPLACE) {
+            j->replace = TRUE;
+        } else {  // BOTH, or anything unexpected: keep both
             PWSTR u = UniqueName(j->dst);
             free(j->dst);
             j->dst = u;
             j->conflict = FALSE;
-        } else {
-            j->replace = TRUE;
         }
     }
-    return TRUE;
+    free(srcs);
+    free(dsts);
+    free((void *)picks);
+    return !cancelled;
 }
 
 // Blocks while paused; FALSE once cancelled.

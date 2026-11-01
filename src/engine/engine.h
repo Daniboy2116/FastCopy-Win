@@ -12,7 +12,8 @@ typedef struct {
 enum { FC_PHASE_PLAN, FC_PHASE_COPY, FC_PHASE_FINISH };
 
 // What to do with files that already exist at the destination (asked once per operation).
-typedef enum { FC_CONFLICT_REPLACE, FC_CONFLICT_SKIP, FC_CONFLICT_BOTH, FC_CONFLICT_CANCEL } FcConflictChoice;
+// FC_CONFLICT_EACH: the answer is per file, in prog->conflictPick (REPLACE, SKIP or BOTH each).
+typedef enum { FC_CONFLICT_REPLACE, FC_CONFLICT_SKIP, FC_CONFLICT_BOTH, FC_CONFLICT_CANCEL, FC_CONFLICT_EACH } FcConflictChoice;
 typedef struct FcProgress FcProgress;
 typedef FcConflictChoice (*FcConflictFn)(FcProgress *prog, int count, PCWSTR example);
 
@@ -30,6 +31,10 @@ struct FcProgress {
     HANDLE conflictEvent;  // signalled by the engine when it starts asking; optional
     volatile LONG conflictPending, conflictChoice, conflictCount;  // choice: -1 until answered, else FcConflictChoice
     WCHAR conflictExample[MAX_PATH];
+    // While a question is open: the conflicting files (source, existing target) and, for an EACH answer,
+    // where to write one FcConflictChoice per file. Owned by the engine; valid until the answer is read.
+    PCWSTR *conflictSrc, *conflictDst;
+    volatile LONG *conflictPick;
 };
 
 typedef enum {

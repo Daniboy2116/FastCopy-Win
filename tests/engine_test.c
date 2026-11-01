@@ -60,7 +60,16 @@ static void BuildTree(PCWSTR root)
 
 static FcConflictChoice gChoice;
 static int gAsked;
-static FcConflictChoice Ask(FcProgress *pr, int count, PCWSTR example) { (void)pr; (void)count; (void)example; gAsked++; return gChoice; }
+static FcConflictChoice Ask(FcProgress *pr, int count, PCWSTR example)
+{
+    (void)example;
+    gAsked++;
+    for (int i = 0; gChoice == FC_CONFLICT_EACH && i < count; i++) {  // per file: f00 replace, f02 keep both, the rest skip
+        PCWSTR name = wcsrchr(pr->conflictSrc[i], L'\\') + 1;
+        pr->conflictPick[i] = !wcscmp(name, L"f00.txt") ? FC_CONFLICT_REPLACE : !wcscmp(name, L"f02.txt") ? FC_CONFLICT_BOTH : FC_CONFLICT_SKIP;
+    }
+    return gChoice;
+}
 
 // Existing targets: resolved by the callback (replace / skip / keep both / cancel), folders merge.
 static void ConflictSuite(PCWSTR root, PCWSTR otherRoot)
@@ -105,6 +114,22 @@ static void ConflictSuite(PCWSTR root, PCWSTR otherRoot)
     gChoice = FC_CONFLICT_REPLACE;
     Reset(&pr)->onConflict = Ask;
     CHECK(FcRun(&folder, 1, &pr) == FC_OK && pr.filesTotal == 52);
+
+    // one answer per file
+    WCHAR s0[MAX_PATH], s1[MAX_PATH], s2[MAX_PATH], d0[MAX_PATH], d1[MAX_PATH], d2[MAX_PATH];
+    Path(s0, root, L"src\\tree\\f00.txt"); Path(d0, otherRoot, L"dst\\tree\\f00.txt");
+    Path(s1, root, L"src\\tree\\f01.txt"); Path(d1, otherRoot, L"dst\\tree\\f01.txt");
+    Path(s2, root, L"src\\tree\\f02.txt"); Path(d2, otherRoot, L"dst\\tree\\f02.txt");
+    WriteFileText(s0, "new zero", 0);
+    WriteFileText(s1, "new one", 0);
+    WriteFileText(s2, "new two", 0);
+    gChoice = FC_CONFLICT_EACH;
+    Reset(&pr)->onConflict = Ask;
+    CHECK(FcRun(&folder, 1, &pr) == FC_OK && pr.filesTotal == 2);
+    CHECK(SameContent(s0, d0));   // replaced
+    CHECK(!SameContent(s1, d1));  // skipped
+    Path(b, otherRoot, L"dst\\tree\\f02 (2).txt");
+    CHECK(Exists(b) && SameContent(s2, b) && !SameContent(s2, d2));  // both kept
 }
 
 static void RunSuite(PCWSTR root, PCWSTR otherRoot)

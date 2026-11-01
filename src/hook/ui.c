@@ -32,7 +32,8 @@
 #define WM_FC_REMOVE (WM_APP + 2)
 #define ID_DETAILS 101
 #define ID_OPBUTTON 200
-#define ID_CONFLICT 300   // three buttons per operation: 300 replace, 301 skip, 302 keep both
+#define ID_CONFLICT 300   // four buttons per operation: 300 replace, 301 skip, 302 keep both, 303 choose file by file
+#define CONFLICT_BTNS 4
 #define MAX_OPS 32
 // Layout in 96-dpi pixels; everything between the two states is interpolated by the morph value.
 #define WIDTH 500
@@ -54,7 +55,7 @@ typedef struct {
     FcProgress *prog;
     BOOL move;
     WCHAR srcName[MAX_PATH], destName[MAX_PATH], srcDir[MAX_PATH], dstDir[MAX_PATH];
-    HWND pause, cancel, cbtn[3];
+    HWND pause, cancel, cbtn[CONFLICT_BTNS];
     double cf;         // 0..1: how far the panel has turned into the conflict question
     BOOL added;        // the UI thread took it over
     BOOL cseen;        // its current question was already scrolled into view
@@ -277,10 +278,10 @@ static void Layout(Dlg *d)
     RECT rc;
     GetClientRect(d->hwnd, &rc);
     int m = S(d, MARGIN), b = S(d, ICON_BTN), footerTop = rc.bottom - S(d, FOOTER_H);
-    int viewTop = m + HeaderH(d), gap = S(d, 8), bw = (rc.right - 2 * m - 2 * gap) / 3, bh = S(d, 34);
+    int viewTop = m + HeaderH(d), gap = S(d, 8), bh = S(d, 34);
     // Buttons move without painting; then the window and all of them paint in one go, so while
     // scrolling the buttons never show up a frame away from the panel they belong to.
-    HDWP dw = BeginDeferWindowPos(2 + 5 * d->n);
+    HDWP dw = BeginDeferWindowPos(2 + 6 * d->n);
     const UINT keep = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS;
     dw = DeferWindowPos(dw, d->details, NULL, m - S(d, 8), footerTop + S(d, 10), S(d, 150), S(d, 32), keep);
     for (int i = 0; i < d->n && dw; i++) {
@@ -292,9 +293,11 @@ static void Layout(Dlg *d)
         dw = DeferWindowPos(dw, o->pause, NULL, rc.right - m - 2 * b + S(d, 2), y, b, b, keep | (visible && !ask ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
         int by = top + S(d, 84);
         BOOL bvisible = ask && o->cf > 0.6 && by >= viewTop && by + bh <= panelBottom && by + bh <= footerTop;
-        for (int k = 0; k < 3 && dw; k++)
+        // One file has nothing to choose file by file: three buttons then, four otherwise.
+        int nb = o->prog->conflictCount > 1 ? CONFLICT_BTNS : CONFLICT_BTNS - 1, bw = (rc.right - 2 * m - (nb - 1) * gap) / nb;
+        for (int k = 0; k < CONFLICT_BTNS && dw; k++)
             if (o->cbtn[k])
-                dw = DeferWindowPos(dw, o->cbtn[k], NULL, m + k * (bw + gap), by, bw, bh, keep | (bvisible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+                dw = DeferWindowPos(dw, o->cbtn[k], NULL, m + k * (bw + gap), by, bw, bh, keep | (bvisible && k < nb ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
     }
     if (dw)
         EndDeferWindowPos(dw);
@@ -854,6 +857,78 @@ static void FocusRing(Dlg *d, HDC dc, RECT rc, int radius)
     DeleteObject(ring);
 }
 
+// ---- File-by-file conflict picker: shared types and drawing ----
+#define ID_PICK_OK 410
+#define ID_PICK_BACK 411
+#define ID_PICK_ALL 412  // +0 the source column, +1 the destination column
+#define ID_PICK_LIST 414
+#define PICK_W 680
+#define PICK_ROW_H 64
+#define PICK_HEAD_H 132  // title, explanation and the two column headers
+#define PICK_FOOT_H 68
+
+typedef struct {
+    ULONGLONG size[2];
+    FILETIME mt[2];
+    int icon[2];  // system image list index
+    BOOL stat;    // size, date and icon looked up (only for rows that get painted)
+    BYTE keep;    // bit 0: keep the source version, bit 1: keep the one already at the destination
+} PickRow;
+
+typedef struct {
+    HWND hwnd, list, ok, back, all[2];
+    Op *op;
+    int n, focus, hot;  // focus and hot: row * 2 + column, or -1
+    PWSTR *src, *dst;   // copies: the engine's arrays may go away if the operation is cancelled
+    PickRow *rows;
+    HIMAGELIST icons;
+} Pick;
+
+static Pick *gPick;  // UI thread only; the owner window is disabled while it is open, so there is one at most
+
+// 0 none of the column is kept, 1 some, 2 all
+static int PickColState(const Pick *p, int col)
+{
+    int on = 0;
+    for (int i = 0; i < p->n; i++)
+        on += (p->rows[i].keep >> col) & 1;
+    return on == 0 ? 0 : on == p->n ? 2 : 1;
+}
+
+static int PickUndecided(const Pick *p)  // files with neither version kept
+{
+    int n = 0;
+    for (int i = 0; i < p->n; i++)
+        n += !p->rows[i].keep;
+    return n;
+}
+
+static void DrawCheck(Dlg *d, HDC dc, RECT box, int state)  // state: 0 off, 1 mixed, 2 on
+{
+    int r = S(d, 5);
+    if (state) {
+        RoundFill(d, dc, box, d->accent, r);
+        SetTextColor(dc, RGB(255, 255, 255));
+        if (state == 2) {
+            SelectObject(dc, d->fontChevron);
+            DrawTextW(dc, L"\xE73E", -1, &box, DT_CENTER | DT_VCENTER | DT_SINGLELINE);  // CheckMark
+        } else {
+            HBRUSH w = CreateSolidBrush(RGB(255, 255, 255));
+            int cy = (box.top + box.bottom) / 2, t = max(2, S(d, 2));
+            RECT dash = { box.left + S(d, 5), cy - t / 2, box.right - S(d, 5), cy - t / 2 + t };
+            FillRect(dc, &dash, w);
+            DeleteObject(w);
+        }
+        return;
+    }
+    HPEN pen = CreatePen(PS_SOLID, max(1, S(d, 1)), Mix(Pal(d)->sub, Pal(d)->bg, 0.8));
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH)), op = SelectObject(dc, pen);
+    RoundRect(dc, box.left, box.top, box.right, box.bottom, r, r);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(pen);
+}
+
 static void DrawButton(Dlg *d, const DRAWITEMSTRUCT *di)
 {
     const Palette *pal = Pal(d);
@@ -865,14 +940,15 @@ static void DrawButton(Dlg *d, const DRAWITEMSTRUCT *di)
     SetBkMode(dc, TRANSPARENT);
     BOOL disabled = di->itemState & ODS_DISABLED, focus = di->itemState & ODS_FOCUS;
     BOOL pressed = di->itemState & ODS_SELECTED, hovered = !disabled && di->hwndItem == d->hover;
-    if (di->CtlID >= ID_CONFLICT && di->CtlID < ID_CONFLICT + 3) {
-        // Keep both is the safe answer, so it gets the accent; the destructive one stays quiet.
-        int k = di->CtlID - ID_CONFLICT;
-        static const PCWSTR labels[3] = { L"Reemplazar", L"Omitir", L"Conservar ambos" };
-        COLORREF fill = k == 2 ? (pressed ? Mix(d->accent, RGB(0, 0, 0), 0.75) : hovered ? Mix(d->accent, RGB(0, 0, 0), 0.88) : d->accent)
+    UINT id = di->CtlID;
+    BOOL conflictBtn = id >= ID_CONFLICT && id < ID_CONFLICT + CONFLICT_BTNS;
+    if (conflictBtn || id == ID_PICK_OK || id == ID_PICK_BACK) {
+        // Keep both / Continue are the safe answers, so they get the accent; the destructive one stays quiet.
+        BOOL accent = id == ID_CONFLICT + 2 || id == ID_PICK_OK;
+        COLORREF fill = accent ? (disabled ? Mix(d->accent, pal->bg, 0.35) : pressed ? Mix(d->accent, RGB(0, 0, 0), 0.75) : hovered ? Mix(d->accent, RGB(0, 0, 0), 0.88) : d->accent)
                                : (pressed ? pal->btnPressed : hovered ? pal->btnHover : pal->btn);
         HBRUSH fb = CreateSolidBrush(fill);
-        HPEN bp = CreatePen(PS_SOLID, 1, k == 2 ? fill : pal->btnBorder);
+        HPEN bp = CreatePen(PS_SOLID, 1, accent ? fill : pal->btnBorder);
         HGDIOBJ ob = SelectObject(dc, fb), op = SelectObject(dc, bp);
         RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, S(d, 8), S(d, 8));
         SelectObject(dc, ob);
@@ -881,9 +957,28 @@ static void DrawButton(Dlg *d, const DRAWITEMSTRUCT *di)
         DeleteObject(bp);
         if (focus)
             FocusRing(d, dc, rc, S(d, 8));
-        SetTextColor(dc, k == 2 ? RGB(255, 255, 255) : pal->text);
+        WCHAR label[48];
+        GetWindowTextW(di->hwndItem, label, 48);
+        SetTextColor(dc, accent ? (disabled ? Mix(RGB(255, 255, 255), pal->bg, 0.6) : RGB(255, 255, 255)) : pal->text);
         SelectObject(dc, d->font);
-        DrawTextW(dc, labels[k], -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        DrawTextW(dc, label, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        return;
+    }
+    if (id == ID_PICK_ALL || id == ID_PICK_ALL + 1) {  // column header: select-all checkbox with the folder's name
+        int col = id - ID_PICK_ALL;
+        if (pressed || hovered)
+            RoundFill(d, dc, rc, pressed ? pal->btnPressed : pal->btnHover, S(d, 8));
+        if (focus)
+            FocusRing(d, dc, rc, S(d, 8));
+        int box = S(d, 20), cy = (rc.top + rc.bottom) / 2;
+        RECT cb = { rc.left + S(d, 14), cy - box / 2, rc.left + S(d, 14) + box, cy - box / 2 + box };
+        DrawCheck(d, dc, cb, gPick ? PickColState(gPick, col) : 0);
+        WCHAR label[MAX_PATH + 16];
+        GetWindowTextW(di->hwndItem, label, MAX_PATH + 16);
+        RECT tr = { cb.right + S(d, 12), rc.top, rc.right - S(d, 8), rc.bottom };
+        SetTextColor(dc, pal->text);
+        SelectObject(dc, d->font);
+        DrawTextW(dc, label, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         return;
     }
     // Like Windows 11's subtle buttons: no surface at rest, a soft one on hover/press.
@@ -986,8 +1081,8 @@ static void Tick(Dlg *d)
         }
         BOOL asking = pr->conflictPending != 0;
         if (asking && !o->cbtn[0]) {
-            static const PCWSTR names[3] = { L"Reemplazar", L"Omitir", L"Conservar ambos" };
-            for (int k = 0; k < 3; k++) {
+            static const PCWSTR names[CONFLICT_BTNS] = { L"Reemplazar", L"Omitir", L"Conservar ambos", L"Elegir archivos…" };
+            for (int k = 0; k < CONFLICT_BTNS; k++) {
                 o->cbtn[k] = CreateWindowExW(0, L"BUTTON", names[k], WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, d->hwnd,
                                              (HMENU)(UINT_PTR)(ID_CONFLICT + k), gInst, NULL);
                 SetWindowSubclass(o->cbtn[k], ButtonProc, 1, (DWORD_PTR)d);
@@ -1046,6 +1141,553 @@ static void WheelScroll(Dlg *d, int delta)
     int step = lines == WHEEL_PAGESCROLL ? d->h * 3 / 4 : (int)lines * S(d, 20);
     d->scroll = max(0, d->scroll - delta * step / WHEEL_DELTA);  // Frame clamps the far end
     Frame(d);
+}
+
+// ---- File-by-file conflict picker: window ----
+// Opened from the "Elegir archivos…" button. A modeless window owned by the progress window, which is
+// disabled while it is open. Every conflicting file shows its two versions side by side with a checkbox
+// each, like Windows' own dialog: source only = replace, destination only = skip, both = keep both.
+static const WCHAR kPickClass[] = L"FastCopyPicker", kListClass[] = L"FastCopyPickList";
+
+static PCWSTR NoPrefix(PCWSTR p) { return !wcsncmp(p, L"\\\\?\\", 4) ? p + 4 : p; }
+
+static void PickStat(Pick *p, int i)
+{
+    PickRow *r = &p->rows[i];
+    if (r->stat)
+        return;
+    r->stat = TRUE;
+    for (int c = 0; c < 2; c++) {
+        PCWSTR path = c ? p->dst[i] : p->src[i], plain = NoPrefix(path);
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (GetFileAttributesExW(path, GetFileExInfoStandard, &fa)) {
+            r->size[c] = ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+            r->mt[c] = fa.ftLastWriteTime;
+        }
+        SHFILEINFOW fi = { 0 };
+        HIMAGELIST il;
+        if (wcslen(plain) < MAX_PATH)
+            il = (HIMAGELIST)SHGetFileInfoW(plain, 0, &fi, sizeof(fi), SHGFI_SYSICONINDEX | SHGFI_LARGEICON);
+        else  // the shell API takes no long paths: the icon of the type will do
+            il = (HIMAGELIST)SHGetFileInfoW(PathFindFileNameW(plain), FILE_ATTRIBUTE_NORMAL, &fi, sizeof(fi),
+                                            SHGFI_SYSICONINDEX | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES);
+        r->icon[c] = il ? fi.iIcon : -1;
+        if (il)
+            p->icons = il;
+    }
+}
+
+static void PickDetail(const PickRow *r, int c, PWSTR out, int cap)
+{
+    if (!r->mt[c].dwHighDateTime && !r->mt[c].dwLowDateTime) {
+        wcscpy_s(out, cap, L"No disponible");
+        return;
+    }
+    WCHAR size[32], date[64], time[32];
+    FILETIME local;
+    SYSTEMTIME st;
+    FileTimeToLocalFileTime(&r->mt[c], &local);
+    FileTimeToSystemTime(&local, &st);
+    StrFormatByteSizeW((LONGLONG)r->size[c], size, 32);
+    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &st, NULL, date, 64, NULL);
+    GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &st, NULL, time, 32);
+    swprintf_s(out, cap, L"%s · %s %s", size, date, time);
+}
+
+static void PickCols(Dlg *d, int clientW, int *x, int *w)
+{
+    int pad = S(d, 16), gap = S(d, 12);
+    *w = (clientW - 2 * pad - gap) / 2;
+    x[0] = pad;
+    x[1] = pad + *w + gap;
+}
+
+static RECT PickCell(Dlg *d, int row, int col, int clientW, int scroll)
+{
+    int x[2], cw, inset = S(d, 4), top = row * S(d, PICK_ROW_H) - scroll;
+    PickCols(d, clientW, x, &cw);
+    RECT r = { x[col], top + inset, x[col] + cw, top + S(d, PICK_ROW_H) - inset };
+    return r;
+}
+
+static int PickScroll(Pick *p)
+{
+    SCROLLINFO si = { sizeof(si), SIF_POS };
+    GetScrollInfo(p->list, SB_VERT, &si);
+    return si.nPos;
+}
+
+static void PickSetScroll(Pick *p, int pos)
+{
+    RECT rc;
+    GetClientRect(p->list, &rc);
+    int top = max(0, p->n * S(&gDlg, PICK_ROW_H) - rc.bottom);
+    SCROLLINFO si = { sizeof(si), SIF_POS, 0, 0, 0, max(0, min(pos, top)) };
+    SetScrollInfo(p->list, SB_VERT, &si, TRUE);
+    InvalidateRect(p->list, NULL, FALSE);
+}
+
+static void PickReveal(Pick *p, int row)
+{
+    RECT rc;
+    GetClientRect(p->list, &rc);
+    int rowH = S(&gDlg, PICK_ROW_H), pos = PickScroll(p);
+    if (row * rowH < pos)
+        pos = row * rowH;
+    else if ((row + 1) * rowH > pos + rc.bottom)
+        pos = (row + 1) * rowH - rc.bottom;
+    PickSetScroll(p, pos);
+}
+
+static void PickLayoutHeads(Pick *p)
+{
+    Dlg *d = &gDlg;
+    RECT lc;
+    GetClientRect(p->list, &lc);
+    int x[2], cw;
+    PickCols(d, lc.right, x, &cw);
+    for (int c = 0; c < 2; c++)
+        SetWindowPos(p->all[c], NULL, x[c], S(d, 88), cw, S(d, 36), SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void PickLayout(Pick *p)
+{
+    Dlg *d = &gDlg;
+    if (!p->list || !p->back)  // still being created
+        return;
+    RECT rc;
+    GetClientRect(p->hwnd, &rc);
+    int head = S(d, PICK_HEAD_H), foot = S(d, PICK_FOOT_H), bw = S(d, 120), bh = S(d, 34), m = S(d, 24);
+    SetWindowPos(p->list, NULL, 0, head, rc.right, max(0, rc.bottom - head - foot), SWP_NOZORDER | SWP_NOACTIVATE);
+    int by = rc.bottom - foot + (foot - bh) / 2;
+    SetWindowPos(p->ok, NULL, rc.right - m - bw, by, bw, bh, SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(p->back, NULL, rc.right - m - 2 * bw - S(d, 8), by, bw, bh, SWP_NOZORDER | SWP_NOACTIVATE);
+    SCROLLINFO si = { sizeof(si), SIF_RANGE | SIF_PAGE, 0, p->n * S(d, PICK_ROW_H) - 1, 0 };
+    GetClientRect(p->list, &rc);
+    si.nPage = rc.bottom;
+    SetScrollInfo(p->list, SB_VERT, &si, TRUE);
+    PickSetScroll(p, PickScroll(p));
+    PickLayoutHeads(p);
+}
+
+static void PickRefresh(Pick *p)
+{
+    EnableWindow(p->ok, PickUndecided(p) == 0);
+    InvalidateRect(p->list, NULL, FALSE);
+    InvalidateRect(p->all[0], NULL, FALSE);
+    InvalidateRect(p->all[1], NULL, FALSE);
+    InvalidateRect(p->ok, NULL, FALSE);
+    InvalidateRect(p->hwnd, NULL, FALSE);
+}
+
+static void PickToggle(Pick *p, int cell)
+{
+    p->rows[cell / 2].keep ^= (BYTE)(1 << (cell % 2));
+    PickRefresh(p);
+}
+
+static void PickPaintList(Pick *p, HDC target, RECT rc)
+{
+    Dlg *d = &gDlg;
+    const Palette *pal = Pal(d);
+    HDC dc = CreateCompatibleDC(target);
+    HBITMAP bmp = CreateCompatibleBitmap(target, rc.right, rc.bottom);
+    HGDIOBJ oldBmp = SelectObject(dc, bmp);
+    HBRUSH b = CreateSolidBrush(pal->bg);
+    FillRect(dc, &rc, b);
+    DeleteObject(b);
+    SetBkMode(dc, TRANSPARENT);
+
+    int rowH = S(d, PICK_ROW_H), scroll = PickScroll(p), first = scroll / rowH, last = min(p->n - 1, (scroll + rc.bottom) / rowH);
+    BOOL listFocus = GetFocus() == p->list;
+    for (int i = first; i <= last; i++) {
+        PickStat(p, i);
+        PickRow *r = &p->rows[i];
+        LONG newer = CompareFileTime(&r->mt[0], &r->mt[1]);
+        for (int c = 0; c < 2; c++) {
+            RECT cell = PickCell(d, i, c, rc.right, scroll);
+            BOOL kept = (r->keep >> c) & 1;
+            HBRUSH fb = CreateSolidBrush(p->hot == i * 2 + c ? pal->btnHover : pal->card);
+            HPEN bp = CreatePen(PS_SOLID, 1, pal->cardBorder);
+            HGDIOBJ ob = SelectObject(dc, fb), op = SelectObject(dc, bp);
+            RoundRect(dc, cell.left, cell.top, cell.right, cell.bottom, S(d, 8), S(d, 8));
+            SelectObject(dc, ob);
+            SelectObject(dc, op);
+            DeleteObject(fb);
+            DeleteObject(bp);
+
+            int cy = (cell.top + cell.bottom) / 2, box = S(d, 20);
+            RECT cb = { cell.left + S(d, 14), cy - box / 2, cell.left + S(d, 14) + box, cy - box / 2 + box };
+            DrawCheck(d, dc, cb, kept ? 2 : 0);
+            int ix = cb.right + S(d, 12), slot = S(d, 36);
+            if (p->icons && r->icon[c] >= 0) {
+                int iw = 32, ih = 32;
+                ImageList_GetIconSize(p->icons, &iw, &ih);
+                ImageList_Draw(p->icons, r->icon[c], dc, ix + (slot - iw) / 2, cy - ih / 2, ILD_TRANSPARENT);
+            }
+            // Versions that will not be kept fade, so the result reads at a glance down the column.
+            COLORREF nameCol = kept ? pal->text : Mix(pal->sub, pal->bg, 0.7), subCol = kept ? pal->sub : Mix(pal->sub, pal->bg, 0.55);
+            int tx = ix + slot + S(d, 12), line = S(d, 20), ty = cy - S(d, 19);
+            RECT nr = { tx, ty, cell.right - S(d, 12), ty + line };
+            if ((c == 0 && newer > 0) || (c == 1 && newer < 0)) {
+                RECT tag = nr;
+                SelectObject(dc, d->font);
+                DrawTextW(dc, L"Más reciente", -1, &tag, DT_SINGLELINE | DT_CALCRECT | DT_NOPREFIX);
+                int tw = tag.right - tag.left;
+                RECT tr = { nr.right - tw, nr.top, nr.right, nr.bottom };
+                SetTextColor(dc, kept ? d->accent : Mix(d->accent, pal->bg, 0.6));
+                DrawTextW(dc, L"Más reciente", -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                nr.right -= tw + S(d, 8);
+            }
+            SelectObject(dc, d->font);
+            SetTextColor(dc, nameCol);
+            DrawTextW(dc, PathFindFileNameW(NoPrefix(c ? p->dst[i] : p->src[i])), -1, &nr,
+                      DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            WCHAR detail[128];
+            PickDetail(r, c, detail, 128);
+            RECT dr = { tx, ty + line, cell.right - S(d, 12), ty + 2 * line - S(d, 2) };
+            SetTextColor(dc, subCol);
+            DrawTextW(dc, detail, -1, &dr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            if (listFocus && p->focus == i * 2 + c)
+                FocusRing(d, dc, cell, S(d, 8));
+        }
+    }
+    BitBlt(target, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+}
+
+static void PickScrollBy(Pick *p, int delta)
+{
+    UINT lines = 3;
+    SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+    RECT rc;
+    GetClientRect(p->list, &rc);
+    int step = lines == WHEEL_PAGESCROLL ? rc.bottom * 3 / 4 : (int)lines * S(&gDlg, 20);
+    PickSetScroll(p, PickScroll(p) - delta * step / WHEEL_DELTA);
+}
+
+static int PickHit(Pick *p, int x, int y)  // the cell under a point of the list, or -1
+{
+    Dlg *d = &gDlg;
+    RECT rc;
+    GetClientRect(p->list, &rc);
+    int scroll = PickScroll(p), row = (y + scroll) / S(d, PICK_ROW_H);
+    if (y < 0 || row >= p->n)
+        return -1;
+    for (int c = 0; c < 2; c++) {
+        RECT cell = PickCell(d, row, c, rc.right, scroll);
+        POINT pt = { x, y };
+        if (PtInRect(&cell, pt))
+            return row * 2 + c;
+    }
+    return -1;
+}
+
+static LRESULT CALLBACK PickListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    Pick *p = gPick;
+    if (!p)
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        PickPaintList(p, dc, rc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SIZE:
+        PickLayout(p);
+        return 0;
+    case WM_GETDLGCODE:
+        return DLGC_WANTARROWS | DLGC_WANTCHARS;
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    case WM_MOUSEWHEEL:
+        PickScrollBy(p, GET_WHEEL_DELTA_WPARAM(wp));
+        return 0;
+    case WM_VSCROLL: {
+        SCROLLINFO si = { sizeof(si), SIF_ALL };
+        GetScrollInfo(hwnd, SB_VERT, &si);
+        int pos = si.nPos, line = S(&gDlg, 20);
+        switch (LOWORD(wp)) {
+        case SB_LINEUP: pos -= line; break;
+        case SB_LINEDOWN: pos += line; break;
+        case SB_PAGEUP: pos -= (int)si.nPage; break;
+        case SB_PAGEDOWN: pos += (int)si.nPage; break;
+        case SB_TOP: pos = 0; break;
+        case SB_BOTTOM: pos = si.nMax; break;
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION: pos = si.nTrackPos; break;
+        }
+        PickSetScroll(p, pos);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        SetFocus(hwnd);
+        int cell = PickHit(p, (short)LOWORD(lp), (short)HIWORD(lp));
+        if (cell >= 0) {
+            p->focus = cell;
+            PickToggle(p, cell);
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        int cell = PickHit(p, (short)LOWORD(lp), (short)HIWORD(lp));
+        if (cell != p->hot) {
+            p->hot = cell;
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            TrackMouseEvent(&tme);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        SetCursor(LoadCursorW(NULL, IDC_ARROW));
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        p->hot = -1;
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    case WM_KEYDOWN: {
+        int row = p->focus / 2, col = p->focus % 2, page = max(1, rc.bottom / S(&gDlg, PICK_ROW_H));
+        switch (wp) {
+        case VK_LEFT: col = 0; break;
+        case VK_RIGHT: col = 1; break;
+        case VK_UP: row--; break;
+        case VK_DOWN: row++; break;
+        case VK_PRIOR: row -= page; break;
+        case VK_NEXT: row += page; break;
+        case VK_HOME: row = 0; break;
+        case VK_END: row = p->n - 1; break;
+        case VK_SPACE:
+            PickToggle(p, p->focus);
+            return 0;
+        default:
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+        row = max(0, min(row, p->n - 1));
+        p->focus = row * 2 + col;
+        PickReveal(p, row);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void ClosePick(Dlg *d, BOOL commit)
+{
+    Pick *p = gPick;
+    if (!p)
+        return;
+    gPick = NULL;
+    FcProgress *pr = p->op->prog;
+    // The engine is still waiting (cancelling is done on this thread and Op removal closes the picker first),
+    // so its pick array is alive.
+    if (commit && pr->conflictPending && pr->conflictPick && !pr->cancel && pr->conflictCount == p->n) {
+        for (int i = 0; i < p->n; i++) {
+            BYTE k = p->rows[i].keep;
+            pr->conflictPick[i] = k == 1 ? FC_CONFLICT_REPLACE : k == 2 ? FC_CONFLICT_SKIP : FC_CONFLICT_BOTH;
+        }
+        InterlockedExchange(&pr->conflictChoice, FC_CONFLICT_EACH);
+        pr->conflictPending = 0;
+        StartFrames(d);
+    }
+    EnableWindow(d->hwnd, TRUE);  // before destroying, or Windows activates some other app's window
+    DestroyWindow(p->hwnd);
+    for (int i = 0; i < p->n; i++) {
+        free(p->src[i]);
+        free(p->dst[i]);
+    }
+    free(p->src);
+    free(p->dst);
+    free(p->rows);
+    free(p);
+}
+
+static void PickPaint(Pick *p, HDC dc, RECT rc)
+{
+    Dlg *d = &gDlg;
+    const Palette *pal = Pal(d);
+    int m = S(d, 24);
+    HBRUSH b = CreateSolidBrush(pal->bg);
+    FillRect(dc, &rc, b);
+    DeleteObject(b);
+    SetBkMode(dc, TRANSPARENT);
+
+    RECT t = { m, S(d, 20), rc.right - m, S(d, 52) };
+    SelectObject(dc, d->fontTitle);
+    SetTextColor(dc, pal->text);
+    DrawTextW(dc, L"Elige qué archivos conservar", -1, &t, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    RECT s = { m, S(d, 54), rc.right - m, S(d, 86) };
+    SelectObject(dc, d->font);
+    SetTextColor(dc, pal->sub);
+    DrawTextW(dc, L"Marca la versión que quieres conservar de cada archivo. Si marcas las dos, se conservan ambas y la copia recibe un número en el nombre.",
+              -1, &s, DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+    int foot = rc.bottom - S(d, PICK_FOOT_H);
+    HPEN line = CreatePen(PS_SOLID, 1, pal->cardBorder);
+    HGDIOBJ op = SelectObject(dc, line);
+    MoveToEx(dc, 0, foot, NULL);
+    LineTo(dc, rc.right, foot);
+    SelectObject(dc, op);
+    DeleteObject(line);
+
+    WCHAR msg[96];
+    int undecided = PickUndecided(p);
+    if (undecided)
+        swprintf_s(msg, 96, undecided == 1 ? L"Marca al menos una versión de %d archivo" : L"Marca al menos una versión de %d archivos", undecided);
+    else
+        swprintf_s(msg, 96, L"%d archivos con el mismo nombre", p->n);
+    RECT h;
+    GetWindowRect(p->back, &h);
+    MapWindowPoints(NULL, p->hwnd, (POINT *)&h, 2);
+    RECT mr = { m, foot, h.left - S(d, 12), rc.bottom };
+    SetTextColor(dc, undecided ? (d->dark ? RGB(252, 225, 0) : kPausedColor) : pal->sub);
+    DrawTextW(dc, msg, -1, &mr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+}
+
+static LRESULT CALLBACK PickProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    Pick *p = gPick;
+    Dlg *d = &gDlg;
+    if (!p)
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC target = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HDC dc = CreateCompatibleDC(target);
+        HBITMAP bmp = CreateCompatibleBitmap(target, rc.right, rc.bottom);
+        HGDIOBJ old = SelectObject(dc, bmp);
+        PickPaint(p, dc, rc);
+        BitBlt(target, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, old);
+        DeleteObject(bmp);
+        DeleteDC(dc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_DRAWITEM:
+        DrawButton(d, (DRAWITEMSTRUCT *)lp);
+        return TRUE;
+    case WM_SETFOCUS:
+        SetFocus(p->list);
+        return 0;
+    case WM_COMMAND: {
+        UINT id = LOWORD(wp);
+        if (id == ID_PICK_ALL || id == ID_PICK_ALL + 1) {
+            int col = id - ID_PICK_ALL, on = PickColState(p, col) != 2;
+            for (int i = 0; i < p->n; i++)
+                p->rows[i].keep = (BYTE)(on ? p->rows[i].keep | (1 << col) : p->rows[i].keep & ~(1 << col));
+            PickRefresh(p);
+        } else if (id == ID_PICK_OK || id == IDOK) {
+            if (!PickUndecided(p))
+                ClosePick(d, TRUE);
+        } else if (id == ID_PICK_BACK || id == IDCANCEL) {
+            ClosePick(d, FALSE);  // back to the question; the operation goes on waiting
+        }
+        return 0;
+    }
+    case WM_CLOSE:
+        ClosePick(d, FALSE);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void SetScrollTheme(Dlg *d, HWND w)  // dark scroll bars in dark mode
+{
+    HMODULE ux = LoadLibraryW(L"uxtheme.dll");
+    typedef HRESULT(WINAPI * SetThemeFn)(HWND, LPCWSTR, LPCWSTR);
+    SetThemeFn f = ux ? (SetThemeFn)GetProcAddress(ux, "SetWindowTheme") : NULL;
+    if (f)
+        f(w, d->dark ? L"DarkMode_Explorer" : L"Explorer", NULL);
+}
+
+static void OpenPick(Dlg *d, Op *o)
+{
+    FcProgress *pr = o->prog;
+    int n = pr->conflictCount;
+    if (gPick || n < 2 || !pr->conflictPending || !pr->conflictSrc || !pr->conflictPick)
+        return;
+    Pick *p = calloc(1, sizeof(Pick));
+    p->op = o;
+    p->n = n;
+    p->hot = -1;
+    p->src = calloc(n, sizeof(PWSTR));
+    p->dst = calloc(n, sizeof(PWSTR));
+    p->rows = calloc(n, sizeof(PickRow));
+    for (int i = 0; i < n; i++) {
+        p->src[i] = _wcsdup(pr->conflictSrc[i]);
+        p->dst[i] = _wcsdup(pr->conflictDst[i]);
+        p->rows[i].keep = 3;  // keeping both loses nothing, so it is where the user starts
+        p->rows[i].icon[0] = p->rows[i].icon[1] = -1;
+    }
+    gPick = p;
+
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfoW(MonitorFromWindow(d->hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
+    RECT wr = { 0, 0, S(d, PICK_W), 0 };
+    AdjustWindowRectExForDpi(&wr, style, FALSE, WS_EX_CONTROLPARENT, d->dpi);
+    int frameH = wr.bottom - wr.top;
+    int ch = min(S(d, 600), (mi.rcWork.bottom - mi.rcWork.top) * 85 / 100 - frameH);
+    wr.bottom = max(ch, S(d, PICK_HEAD_H + PICK_FOOT_H + PICK_ROW_H));
+    AdjustWindowRectExForDpi(&wr, style, FALSE, WS_EX_CONTROLPARENT, d->dpi);
+    RECT owner;
+    GetWindowRect(d->hwnd, &owner);
+    int w = wr.right - wr.left, h = wr.bottom - wr.top;
+    int x = max(mi.rcWork.left, min((owner.left + owner.right - w) / 2, mi.rcWork.right - w));
+    int y = max(mi.rcWork.top, min((owner.top + owner.bottom - h) / 2, mi.rcWork.bottom - h));
+    p->hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, kPickClass, L"Reemplazar u omitir archivos", style, x, y, w, h, d->hwnd, NULL, gInst, NULL);
+    if (!p->hwnd) {
+        gPick = NULL;
+        for (int i = 0; i < n; i++) {
+            free(p->src[i]);
+            free(p->dst[i]);
+        }
+        free(p->src);
+        free(p->dst);
+        free(p->rows);
+        free(p);
+        return;
+    }
+    BOOL dark = d->dark;
+    if (FAILED(DwmSetWindowAttribute(p->hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark))))
+        DwmSetWindowAttribute(p->hwnd, 19, &dark, sizeof(dark));
+
+    // Tab order is creation order: the two select-all headers, the list, then the buttons.
+    WCHAR label[MAX_PATH + 16];
+    for (int c = 0; c < 2; c++) {
+        swprintf_s(label, MAX_PATH + 16, c ? L"Destino · %s" : L"Origen · %s", c ? o->destName : o->srcName);
+        p->all[c] = CreateWindowExW(0, L"BUTTON", label, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, p->hwnd,
+                                    (HMENU)(UINT_PTR)(ID_PICK_ALL + c), gInst, NULL);
+        SetWindowSubclass(p->all[c], ButtonProc, 1, (DWORD_PTR)d);
+    }
+    p->list = CreateWindowExW(0, kListClass, L"Archivos en conflicto", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL, 0, 0, 0, 0, p->hwnd, (HMENU)ID_PICK_LIST, gInst, NULL);
+    SetScrollTheme(d, p->list);
+    p->ok = CreateWindowExW(0, L"BUTTON", L"Continuar", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, p->hwnd,
+                            (HMENU)ID_PICK_OK, gInst, NULL);
+    p->back = CreateWindowExW(0, L"BUTTON", L"Volver", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, p->hwnd,
+                              (HMENU)ID_PICK_BACK, gInst, NULL);
+    SetWindowSubclass(p->ok, ButtonProc, 1, (DWORD_PTR)d);
+    SetWindowSubclass(p->back, ButtonProc, 1, (DWORD_PTR)d);
+    PickLayout(p);
+    EnableWindow(d->hwnd, FALSE);
+    ShowWindow(p->hwnd, SW_SHOWNORMAL);
+    SetFocus(p->list);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -1131,10 +1773,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         Op *o = OpOfButton(d, (HWND)lp, &isPause);
         Op *ask = NULL;
         for (int i = 0; i < d->n && !ask; i++)
-            for (int k = 0; k < 3; k++)
+            for (int k = 0; k < CONFLICT_BTNS; k++)
                 if (d->ops[i]->cbtn[k] && d->ops[i]->cbtn[k] == (HWND)lp)
                     ask = d->ops[i];
-        if (ask) {
+        if (ask && LOWORD(wp) == ID_CONFLICT + 3) {
+            OpenPick(d, ask);  // the question stays open until the list is answered
+        } else if (ask) {
             InterlockedExchange(&ask->prog->conflictChoice, LOWORD(wp) - ID_CONFLICT);
             ask->prog->conflictPending = 0;
             StartFrames(d);
@@ -1384,7 +2028,9 @@ static void RemoveOp(Dlg *d, Op *o)
         DeleteObject(o->meterBmp);
     DestroyWindow(o->pause);
     DestroyWindow(o->cancel);
-    for (int k = 0; k < 3; k++)
+    if (gPick && gPick->op == o)
+        ClosePick(d, FALSE);
+    for (int k = 0; k < CONFLICT_BTNS; k++)
         if (o->cbtn[k])
             DestroyWindow(o->cbtn[k]);
     memmove(&d->ops[i], &d->ops[i + 1], (d->n - i - 1) * sizeof(Op *));
@@ -1422,6 +2068,14 @@ static DWORD WINAPI UiThread(LPVOID ready)
     GetModuleFileNameW(NULL, exe, MAX_PATH);  // reuse Explorer's own icon
     wc.hIcon = ExtractIconW(gInst, exe, 0);
     RegisterClassExW(&wc);
+    WNDCLASSEXW pc = wc;
+    pc.lpfnWndProc = PickProc;
+    pc.lpszClassName = kPickClass;
+    RegisterClassExW(&pc);
+    pc.lpfnWndProc = PickListProc;
+    pc.lpszClassName = kListClass;
+    pc.hIcon = NULL;
+    RegisterClassExW(&pc);
     WNDCLASSEXW mc = { sizeof(mc) };
     mc.lpfnWndProc = MgrProc;
     mc.hInstance = gInst;
@@ -1432,6 +2086,8 @@ static DWORD WINAPI UiThread(LPVOID ready)
 
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (gPick && IsDialogMessageW(gPick->hwnd, &m))
+            continue;
         if (!gDlg.hwnd || !IsDialogMessageW(gDlg.hwnd, &m)) {
             TranslateMessage(&m);
             DispatchMessageW(&m);
