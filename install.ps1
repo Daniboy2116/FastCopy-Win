@@ -1,8 +1,10 @@
-# Installs FastCopy: copies bin\ to %ProgramFiles%\FastCopy (elevated, so only admins can swap
+﻿# Installs FastCopy: copies bin\ to %ProgramFiles%\FastCopy (elevated, so only admins can swap
 # the DLL Explorer loads) and starts the agent at logon (scheduled task) and now, as the normal user.
 # Not %LOCALAPPDATA%: Explorer fails to LoadLibrary from AppData on this build.
 $ErrorActionPreference = 'Stop'
-$src = Join-Path $PSScriptRoot 'bin'
+# From a clone the binaries are in bin\; in the downloaded zip they sit next to this script.
+$src = if (Test-Path (Join-Path $PSScriptRoot 'bin' | Join-Path -ChildPath 'fc_hook.dll')) { Join-Path $PSScriptRoot 'bin' } else { $PSScriptRoot }
+if (-not (Test-Path (Join-Path $src 'fc_hook.dll'))) { throw 'No encuentro fc_hook.dll. Extrae el ZIP completo antes de instalar.' }
 $dst = Join-Path $env:ProgramFiles 'FastCopy'
 $hook = Join-Path $dst 'fc_hook.dll'
 

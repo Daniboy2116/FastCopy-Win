@@ -1,4 +1,4 @@
-# Removes FastCopy and restarts Explorer so the hook is unloaded.
+﻿# Removes FastCopy and restarts Explorer so the hook is unloaded.
 $dst = Join-Path $env:ProgramFiles 'FastCopy'
 
 Unregister-ScheduledTask -TaskName 'FastCopyAgent' -Confirm:$false -ErrorAction SilentlyContinue

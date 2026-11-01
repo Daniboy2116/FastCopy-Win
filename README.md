@@ -4,6 +4,16 @@ Motor de copia y movimiento de archivos propio para el **Explorador de Windows**
 
 > **Estado: experimental.** Funciona y está probado en una sola máquina (Windows 11 IoT Enterprise LTSC 2024, build 26100.6713). Úsalo bajo tu propia responsabilidad y lee la sección [Riesgos](#riesgos).
 
+## Instalar (sin programar nada)
+
+1. Descarga **`FastCopy-Win.zip`** de la página de [Releases](https://github.com/Daniboy2116/FastCopy-Win/releases/latest).
+2. Haz clic derecho sobre el ZIP → **Extraer todo…**
+3. Abre la carpeta y haz doble clic en **`Instalar.bat`**. Windows pedirá permiso de administrador una vez, y el Explorador se reiniciará (se cierran las ventanas de carpetas abiertas).
+
+Listo: copiar y mover en el Explorador ya pasa por FastCopy. Para quitarlo, doble clic en **`Desinstalar.bat`**.
+
+Windows puede mostrar un aviso de SmartScreen porque los archivos no están firmados: pulsa **Más información → Ejecutar de todos modos**. Antes de instalar, lee los [Riesgos](#riesgos).
+
 ## Por qué
 
 El copiado del Explorador es lento con muchos archivos, sobre todo entre discos rápidos (NVMe), porque copia casi en serie y pasa todo por la caché del sistema. FastCopy copia en paralelo y sin caché para archivos grandes.
@@ -79,7 +89,7 @@ Si lo pruebas en otra versión, abre un issue contando cómo fue (y adjunta `%TE
 ## Requisitos
 
 - Una versión compatible de la tabla anterior.
-- Para compilar: Visual Studio 2022 Build Tools con el componente de C++ (MSVC) y el Windows SDK.
+- Para compilar (no hace falta para usar el ZIP de Releases): Visual Studio 2022 Build Tools con el componente de C++ (MSVC) y el Windows SDK.
 - Permisos de administrador solo para instalar (copiar a `Program Files`).
 
 ## Compilar
@@ -105,6 +115,8 @@ git submodule update --init
 | `engine_test.exe` | Tests del motor (no toca el Explorador) |
 | `ui_demo.exe` | Abre la ventana de progreso real fuera del Explorador: `ui_demo.exe <destino> <archivo> [<archivo>...]` |
 
+`package.bat` compila y deja en `dist\FastCopy-Win.zip` lo que necesita un usuario (es el archivo que se sube a Releases).
+
 Para probar la ventana con discos rápidos, escribe un número N en `%TEMP%\fastcopy_slow` y cada archivo se copiará a N MB/s como mucho (también dentro del Explorador). Bórralo para volver a la velocidad normal.
 
 Para pasar los tests:
@@ -115,7 +127,9 @@ Para pasar los tests:
 
 Usan una carpeta temporal y, si existe, el disco `D:` para probar entre volúmenes.
 
-## Instalar y desinstalar
+## Instalar desde el código y desinstalar
+
+Si compilaste tú mismo (o prefieres la consola), en lugar de `Instalar.bat`:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
