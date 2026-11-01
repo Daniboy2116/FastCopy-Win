@@ -10,6 +10,7 @@
 #define CINTERFACE
 #define COBJMACROS
 #include <windows.h>
+#include <directmanipulation.h>
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <math.h>
@@ -31,6 +32,7 @@
 #define WM_FC_REMOVE (WM_APP + 2)
 #define ID_DETAILS 101
 #define ID_OPBUTTON 200
+#define ID_CONFLICT 300   // three buttons per operation: 300 replace, 301 skip, 302 keep both
 #define MAX_OPS 32
 // Layout in 96-dpi pixels; everything between the two states is interpolated by the morph value.
 #define WIDTH 500
@@ -41,6 +43,7 @@
 #define GRAPH_H 120
 #define ROWS_H 104
 #define PANEL_BASE_H 108  // collapsed panel incl. the gap below it
+#define CONFLICT_H 132    // a panel asking what to do with files that already exist
 #define FOOTER_H 52
 #define ICON_BTN 32
 #define GRAPH_POINTS 200  // speed samples across 0..100 % of the operation
@@ -51,7 +54,12 @@ typedef struct {
     FcProgress *prog;
     BOOL move;
     WCHAR srcName[MAX_PATH], destName[MAX_PATH], srcDir[MAX_PATH], dstDir[MAX_PATH];
-    HWND pause, cancel;
+    HWND pause, cancel, cbtn[3];
+    double cf;         // 0..1: how far the panel has turned into the conflict question
+    BOOL added;        // the UI thread took it over
+    BOOL cseen;        // its current question was already scrolled into view
+    HBITMAP meterBmp;  // cached pixels of the meter and the key they were drawn for
+    unsigned char meterKey[96];  // a MeterKey
     double appear;     // 0..1 while its panel unfolds into the window
     double shownFrac;  // progress drawn, eased towards the real value between engine ticks
     ULONGLONG lastTick, activeMs;
@@ -71,10 +79,20 @@ typedef struct {
     double t, tFrom, tTo;
     ULONGLONG animStart, animMs;
     int h;      // client height, eased towards the layout's height
-    int shown;  // panels that fit on screen; the rest are summarised in the footer
+    BOOL drag;  // the scroll thumb is being dragged
+    int grab;   // pointer offset inside the thumb while dragging
+    int content, scroll;  // total panel height and how far the list is scrolled (px); the window caps at 85 % of the screen
     Op *ops[MAX_OPS];
     int n;
     ITaskbarList3 *taskbar;
+    // Precision touchpads: inside Explorer, Windows sends no wheel messages for them; like Explorer's
+    // own views, the window takes two-finger pans through DirectManipulation (dm*).
+    IDirectManipulationManager *dm;
+    IDirectManipulationUpdateManager *dmUpdate;
+    IDirectManipulationViewport *dmView;
+    DWORD dmCookie;
+    BOOL dmActive;     // a pan or its inertia is running: DirectManipulation needs Update() every frame
+    float dmY, dmRem;  // last content offset seen, and the sub-pixel rest not yet scrolled
 } Dlg;
 
 typedef struct {
@@ -88,7 +106,7 @@ static const Palette kDark = { RGB(32, 32, 32), RGB(255, 255, 255), RGB(200, 200
                                RGB(55, 55, 55), RGB(52, 52, 52), RGB(44, 44, 44), RGB(75, 75, 75),
                                RGB(43, 43, 43), RGB(29, 29, 29) };
 static const COLORREF kPausedColor = RGB(157, 93, 0);
-static const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+static const DWORD kStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
 
 static Dlg gDlg;   // UI thread only
 static HWND gMgr;  // message-only window of the UI thread
@@ -190,7 +208,8 @@ static int HeaderH(Dlg *d) { return d->n > 1 ? S(d, HEADER_H) : 0; }
 
 static int PanelH(Dlg *d, Op *o)
 {
-    return (int)((S(d, PANEL_BASE_H) + (S(d, GRAPH_H - BAR_H) + S(d, 10 + ROWS_H)) * d->t) * o->appear + 0.5);
+    int normal = (int)(S(d, PANEL_BASE_H) + (S(d, GRAPH_H - BAR_H) + S(d, 10 + ROWS_H)) * d->t);
+    return (int)(Lerp(normal, S(d, CONFLICT_H), o->cf) * o->appear + 0.5);
 }
 
 // Height the window wants now; also decides how many panels fit (85 % of the work area).
@@ -202,15 +221,10 @@ static int LayoutHeight(Dlg *d)
     AdjustWindowRectExForDpi(&frame, kStyle, FALSE, WS_EX_CONTROLPARENT, d->dpi);
     int maxH = (mi.rcWork.bottom - mi.rcWork.top) * 85 / 100 - (frame.bottom - frame.top);
     int h = S(d, MARGIN) + HeaderH(d) + S(d, FOOTER_H);
-    d->shown = 0;
-    for (int i = 0; i < d->n; i++) {
-        int ph = PanelH(d, d->ops[i]);
-        if (d->shown && h + ph > maxH)
-            break;
-        h += ph;
-        d->shown++;
-    }
-    return h;
+    d->content = 0;
+    for (int i = 0; i < d->n; i++)
+        d->content += PanelH(d, d->ops[i]);
+    return d->n ? min(h + d->content, max(maxH, h + PanelH(d, d->ops[0]))) : h;
 }
 
 static int PanelTop(Dlg *d, int index)
@@ -218,7 +232,7 @@ static int PanelTop(Dlg *d, int index)
     int y = S(d, MARGIN) + HeaderH(d);
     for (int i = 0; i < index; i++)
         y += PanelH(d, d->ops[i]);
-    return y;
+    return y - d->scroll;
 }
 
 static void ApplyHeight(Dlg *d)
@@ -241,14 +255,28 @@ static void Layout(Dlg *d)
     RECT rc;
     GetClientRect(d->hwnd, &rc);
     int m = S(d, MARGIN), b = S(d, ICON_BTN), footerTop = rc.bottom - S(d, FOOTER_H);
-    SetWindowPos(d->details, NULL, m - S(d, 8), footerTop + S(d, 10), S(d, 150), S(d, 32), SWP_NOZORDER);
-    for (int i = 0; i < d->n; i++) {
+    int viewTop = m + HeaderH(d), gap = S(d, 8), bw = (rc.right - 2 * m - 2 * gap) / 3, bh = S(d, 34);
+    // Buttons move without painting; then the window and all of them paint in one go, so while
+    // scrolling the buttons never show up a frame away from the panel they belong to.
+    HDWP dw = BeginDeferWindowPos(2 + 5 * d->n);
+    const UINT keep = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS;
+    dw = DeferWindowPos(dw, d->details, NULL, m - S(d, 8), footerTop + S(d, 10), S(d, 150), S(d, 32), keep);
+    for (int i = 0; i < d->n && dw; i++) {
         Op *o = d->ops[i];
-        int top = PanelTop(d, i), y = top + S(d, 22);
-        BOOL visible = i < d->shown && y + b <= top + PanelH(d, o) && y + b <= footerTop;
-        SetWindowPos(o->cancel, NULL, rc.right - m - b + S(d, 6), y, b, b, SWP_NOZORDER | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
-        SetWindowPos(o->pause, NULL, rc.right - m - 2 * b + S(d, 2), y, b, b, SWP_NOZORDER | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+        int top = PanelTop(d, i), y = top + S(d, 22), panelBottom = top + PanelH(d, o);
+        BOOL visible = y >= viewTop && y + b <= panelBottom && y + b <= footerTop;
+        BOOL ask = o->prog->conflictPending != 0;
+        dw = DeferWindowPos(dw, o->cancel, NULL, rc.right - m - b + S(d, 6), y, b, b, keep | (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+        dw = DeferWindowPos(dw, o->pause, NULL, rc.right - m - 2 * b + S(d, 2), y, b, b, keep | (visible && !ask ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+        int by = top + S(d, 84);
+        BOOL bvisible = ask && o->cf > 0.6 && by >= viewTop && by + bh <= panelBottom && by + bh <= footerTop;
+        for (int k = 0; k < 3 && dw; k++)
+            if (o->cbtn[k])
+                dw = DeferWindowPos(dw, o->cbtn[k], NULL, m + k * (bw + gap), by, bw, bh, keep | (bvisible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
     }
+    if (dw)
+        EndDeferWindowPos(dw);
+    RedrawWindow(d->hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
 
 static void StartFrames(Dlg *d) { SetTimer(d->hwnd, TIMER_FRAME, FRAME_MS, NULL); }
@@ -270,7 +298,9 @@ static void ToggleDetails(Dlg *d)
 // One animation frame. FALSE once everything has settled.
 static BOOL Frame(Dlg *d)
 {
-    BOOL busy = FALSE, morphing = d->t != d->tTo;
+    if (d->dmActive)
+        IDirectManipulationUpdateManager_Update(d->dmUpdate, NULL);  // moves d->scroll via DmContent
+    BOOL busy = d->dmActive, morphing = d->t != d->tTo;
     if (morphing) {
         double p = d->animMs ? (double)(GetTickCount64() - d->animStart) / d->animMs : 1;
         d->t = p >= 1 ? d->tTo : d->tFrom + (d->tTo - d->tFrom) * EaseOut(p);
@@ -281,6 +311,11 @@ static BOOL Frame(Dlg *d)
         if (o->appear < 1) {
             o->appear = d->motion && o->appear < 0.995 ? o->appear + (1 - o->appear) * 0.22 : 1;
             busy |= o->appear < 1;
+        }
+        double ct = o->prog->conflictPending ? 1 : 0;
+        if (o->cf != ct) {
+            o->cf = d->motion && fabs(ct - o->cf) > 0.005 ? o->cf + (ct - o->cf) * 0.25 : ct;
+            busy |= o->cf != ct;
         }
         double real = RealFrac(o), diff = real - o->shownFrac;
         if (d->motion && fabs(diff) > 0.0005) {
@@ -300,8 +335,8 @@ static BOOL Frame(Dlg *d)
     }
     if (d->h != before)
         ApplyHeight(d);
-    Layout(d);
-    InvalidateRect(d->hwnd, NULL, FALSE);
+    d->scroll = max(0, min(d->scroll, d->content - (d->h - S(d, MARGIN) - HeaderH(d) - S(d, FOOTER_H))));
+    Layout(d);  // also repaints
     return busy;
 }
 
@@ -314,7 +349,7 @@ static RECT MeterRect(Dlg *d, int top, int width)
 // The bar and the graph are one shape. At t = 0 every sample's area reaches the top, so the
 // accent fill up to shownFrac is exactly the progress bar; as t grows the shape deepens into
 // the speed curve, the track becomes the graph background and the fill turns into a gradient.
-static void DrawMeter(Dlg *d, Op *o, HDC target, RECT r)
+static void RenderMeter(Dlg *d, Op *o, HDC target, RECT r)
 {
     const Palette *pal = Pal(d);
     double t = d->t;
@@ -439,6 +474,52 @@ static void DrawMeter(Dlg *d, Op *o, HDC target, RECT r)
     SelectObject(dc, oldBmp);
     DeleteObject(bmp);
     DeleteDC(dc);
+
+}
+
+// The meter only changes with the operation's state, not when the list scrolls, so its pixels are cached.
+typedef struct {
+    double t, fill, peak, last, avg;
+    int n, w, h;
+    BOOL paused, dark;
+    COLORREF accent;
+} MeterKey;
+
+static void DrawMeter(Dlg *d, Op *o, HDC target, RECT r)
+{
+    const Palette *pal = Pal(d);
+    double t = d->t;
+    int w = r.right - r.left, h = r.bottom - r.top;
+    MeterKey key;
+    memset(&key, 0, sizeof(key));
+    key.t = t;
+    key.fill = o->shownFrac;
+    key.peak = o->peak;
+    key.n = o->graphN;
+    key.last = o->graphN ? o->graph[o->graphN - 1] : 0;
+    key.avg = o->activeMs ? o->prog->bytesDone * 1000.0 / o->activeMs : 0;
+    key.w = w;
+    key.h = h;
+    key.paused = o->prog->paused != 0;
+    key.dark = d->dark;
+    key.accent = d->accent;
+    HDC mem = CreateCompatibleDC(target);
+    if (o->meterBmp && !memcmp(&key, o->meterKey, sizeof(key))) {
+        HGDIOBJ old = SelectObject(mem, o->meterBmp);
+        BitBlt(target, r.left, r.top, w, h, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
+    } else {
+        RenderMeter(d, o, target, r);
+        if (o->meterBmp)
+            DeleteObject(o->meterBmp);
+        o->meterBmp = CreateCompatibleBitmap(target, w, h);
+        HGDIOBJ old = SelectObject(mem, o->meterBmp);
+        BitBlt(mem, 0, 0, w, h, target, r.left, r.top, SRCCOPY);
+        SelectObject(mem, old);
+        memcpy(o->meterKey, &key, sizeof(key));
+    }
+    DeleteDC(mem);
+    COLORREF meterBg = Mix(pal->track, pal->card, 1 - t);
 
     // Current speed as the largest figure, average and peak beside it; they arrive last.
     double kk = Clamp01((t - 0.6) / 0.4);
@@ -574,6 +655,28 @@ static void PaintPanel(Dlg *d, Op *o, HDC dc, int top, int width)
     SelectObject(dc, d->font);
     DrawPieces(dc, m, top, right, S(d, 20), pieces, colors, 4);
 
+    if (pr->conflictPending) {
+        // The question replaces the meter; its three buttons are child windows below this text.
+        WCHAR ask[128];
+        LONG count = pr->conflictCount;
+        if (count == 1)
+            swprintf_s(ask, 128, L"«%s» ya existe en el destino", PathFindFileNameW(pr->conflictExample));
+        else
+            swprintf_s(ask, 128, L"%ld archivos ya existen en el destino", count);
+        RECT q = { m, top + S(d, 24), right - S(d, ICON_BTN) - S(d, 8), top + S(d, 52) };
+        SelectObject(dc, d->fontTitle);
+        SetTextColor(dc, pal->text);
+        DrawTextW(dc, ask, -1, &q, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        swprintf_s(line, 512, count == 1 ? L"%s" : L"Por ejemplo: %s", pr->conflictExample);
+        q.top = top + S(d, 54);
+        q.bottom = q.top + S(d, 22);
+        q.right = right;
+        SelectObject(dc, d->font);
+        SetTextColor(dc, pal->sub);
+        DrawTextW(dc, line, -1, &q, DT_SINGLELINE | DT_VCENTER | DT_PATH_ELLIPSIS | DT_NOPREFIX);
+        return;
+    }
+
     // "45 % completado" large, with the icon buttons (child windows) to its right.
     int pct = (int)(RealFrac(o) * 100);
     if (pr->cancel)
@@ -621,6 +724,21 @@ static void PaintPanel(Dlg *d, Op *o, HDC dc, int top, int width)
     }
 }
 
+// Scroll thumb geometry; FALSE when everything fits.
+static BOOL ThumbGeom(Dlg *d, RECT *thumb, int *viewTop, int *viewH)
+{
+    RECT rc;
+    GetClientRect(d->hwnd, &rc);
+    *viewTop = S(d, MARGIN) + HeaderH(d);
+    *viewH = rc.bottom - S(d, FOOTER_H) - *viewTop;
+    if (*viewH <= 0 || d->content <= *viewH)
+        return FALSE;
+    int th = max(S(d, 24), *viewH * *viewH / d->content);
+    int ty = *viewTop + (*viewH - th) * d->scroll / (d->content - *viewH);
+    SetRect(thumb, rc.right - S(d, 8), ty, rc.right - S(d, 3), ty + th);
+    return TRUE;
+}
+
 static void Paint(Dlg *d, HDC target)
 {
     const Palette *pal = Pal(d);
@@ -646,15 +764,18 @@ static void Paint(Dlg *d, HDC target)
     }
 
     HPEN sep = CreatePen(PS_SOLID, 1, Mix(pal->track, pal->bg, 0.6));
-    for (int i = 0; i < d->shown; i++) {
+    int viewTop = m + HeaderH(d);
+    for (int i = 0; i < d->n; i++) {
         Op *o = d->ops[i];
         int top = PanelTop(d, i), ph = PanelH(d, o);
+        if (top + ph <= viewTop || top >= footerTop)
+            continue;
         int saved = SaveDC(dc);
-        // A panel only ever draws inside its own (unfolding) slot and above the footer.
-        IntersectClipRect(dc, 0, top, rc.right, min(top + ph, footerTop));
+        // A panel only ever draws inside its own (unfolding) slot, between the header and the footer.
+        IntersectClipRect(dc, 0, max(top, viewTop), rc.right, min(top + ph, footerTop));
         PaintPanel(d, o, dc, top, rc.right);
         RestoreDC(dc, saved);
-        if (i > 0) {
+        if (i > 0 && top - S(d, 9) >= viewTop) {
             HGDIOBJ op = SelectObject(dc, sep);
             MoveToEx(dc, m, top - S(d, 9), NULL);
             LineTo(dc, rc.right - m, top - S(d, 9));
@@ -663,12 +784,15 @@ static void Paint(Dlg *d, HDC target)
     }
     DeleteObject(sep);
 
-    if (d->shown < d->n) {
-        swprintf_s(line, 128, d->n - d->shown == 1 ? L"y 1 operación más" : L"y %d operaciones más", d->n - d->shown);
-        RECT r = { m, footerTop, rc.right - m, rc.bottom };
-        SelectObject(dc, d->font);
-        SetTextColor(dc, pal->sub);
-        DrawTextW(dc, line, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+    RECT tr;
+    int tvTop, tvH;
+    if (ThumbGeom(d, &tr, &tvTop, &tvH)) {  // thin scroll thumb on the right edge
+        HBRUSH thumb = CreateSolidBrush(d->drag ? pal->sub : pal->btnBorder);
+        HGDIOBJ ob = SelectObject(dc, thumb), op = SelectObject(dc, GetStockObject(NULL_PEN));
+        RoundRect(dc, tr.left, tr.top, tr.right, tr.bottom, S(d, 5), S(d, 5));
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+        DeleteObject(thumb);
     }
 
     BitBlt(target, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
@@ -719,6 +843,27 @@ static void DrawButton(Dlg *d, const DRAWITEMSTRUCT *di)
     SetBkMode(dc, TRANSPARENT);
     BOOL disabled = di->itemState & ODS_DISABLED, focus = di->itemState & ODS_FOCUS;
     BOOL pressed = di->itemState & ODS_SELECTED, hovered = !disabled && di->hwndItem == d->hover;
+    if (di->CtlID >= ID_CONFLICT && di->CtlID < ID_CONFLICT + 3) {
+        // Keep both is the safe answer, so it gets the accent; the destructive one stays quiet.
+        int k = di->CtlID - ID_CONFLICT;
+        static const PCWSTR labels[3] = { L"Reemplazar", L"Omitir", L"Conservar ambos" };
+        COLORREF fill = k == 2 ? (pressed ? Mix(d->accent, RGB(0, 0, 0), 0.75) : hovered ? Mix(d->accent, RGB(0, 0, 0), 0.88) : d->accent)
+                               : (pressed ? pal->btnPressed : hovered ? pal->btnHover : pal->btn);
+        HBRUSH fb = CreateSolidBrush(fill);
+        HPEN bp = CreatePen(PS_SOLID, 1, k == 2 ? fill : pal->btnBorder);
+        HGDIOBJ ob = SelectObject(dc, fb), op = SelectObject(dc, bp);
+        RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, S(d, 8), S(d, 8));
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+        DeleteObject(fb);
+        DeleteObject(bp);
+        if (focus)
+            FocusRing(d, dc, rc, S(d, 8));
+        SetTextColor(dc, k == 2 ? RGB(255, 255, 255) : pal->text);
+        SelectObject(dc, d->font);
+        DrawTextW(dc, labels[k], -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        return;
+    }
     // Like Windows 11's subtle buttons: no surface at rest, a soft one on hover/press.
     if (pressed || hovered)
         RoundFill(d, dc, rc, pressed ? pal->btnPressed : pal->btnHover, S(d, 8));
@@ -765,6 +910,8 @@ static LRESULT CALLBACK ButtonProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UI
     } else if (msg == WM_NCDESTROY && d->hover == hwnd) {
         d->hover = NULL;
     }
+    if (msg == WM_MOUSEWHEEL || msg == WM_POINTERWHEEL)  // scroll the list even when the pointer is over an icon button
+        return SendMessageW(GetParent(hwnd), msg, wp, lp);
     return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
@@ -815,6 +962,27 @@ static void Tick(Dlg *d)
                     o->graphN = idx + 1;
             }
         }
+        BOOL asking = pr->conflictPending != 0;
+        if (asking && !o->cbtn[0]) {
+            static const PCWSTR names[3] = { L"Reemplazar", L"Omitir", L"Conservar ambos" };
+            for (int k = 0; k < 3; k++) {
+                o->cbtn[k] = CreateWindowExW(0, L"BUTTON", names[k], WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, d->hwnd,
+                                             (HMENU)(UINT_PTR)(ID_CONFLICT + k), gInst, NULL);
+                SetWindowSubclass(o->cbtn[k], ButtonProc, 1, (DWORD_PTR)d);
+            }
+        }
+        if (asking && !o->cseen) {  // bring the question into view; scrolling away is the user's call afterwards
+            o->cseen = TRUE;
+            int abs = PanelTop(d, i) + d->scroll, viewTop = S(d, MARGIN) + HeaderH(d);
+            RECT crc;
+            GetClientRect(d->hwnd, &crc);
+            if (abs - d->scroll < viewTop || abs - d->scroll + S(d, CONFLICT_H) > crc.bottom - S(d, FOOTER_H))
+                d->scroll = max(0, abs - viewTop);
+        } else if (!asking) {
+            o->cseen = FALSE;
+        }
+        if ((asking ? 1.0 : 0.0) != o->cf)
+            StartFrames(d);
         o->lastTick = now;
         o->lastBytes = bytes;
         sumDone += bytes;
@@ -849,6 +1017,15 @@ static void CancelOp(Op *o)
     EnableWindow(o->cancel, FALSE);
 }
 
+static void WheelScroll(Dlg *d, int delta)
+{
+    UINT lines = 3;
+    SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+    int step = lines == WHEEL_PAGESCROLL ? d->h * 3 / 4 : (int)lines * S(d, 20);
+    d->scroll = max(0, d->scroll - delta * step / WHEEL_DELTA);  // Frame clamps the far end
+    Frame(d);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     Dlg *d = &gDlg;
@@ -860,6 +1037,54 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         EndPaint(hwnd, &ps);
         return 0;
     }
+    case DM_POINTERHITTEST: {  // a touchpad contact begins over the window: hand it to DirectManipulation
+        POINTER_INPUT_TYPE type;
+        UINT32 id = GET_POINTERID_WPARAM(wp);
+        if (d->dmView && GetPointerType(id, &type) && type == PT_TOUCHPAD)
+            IDirectManipulationViewport_SetContact(d->dmView, id);
+        return 0;
+    }
+    case WM_MOUSEWHEEL:
+    case WM_POINTERWHEEL:  // processes that turn the mouse into pointer input
+        WheelScroll(d, GET_WHEEL_DELTA_WPARAM(wp));
+        return 0;
+    case WM_LBUTTONDOWN: {
+        RECT t, rc;
+        int top, h, x = (short)LOWORD(lp), y = (short)HIWORD(lp);
+        GetClientRect(hwnd, &rc);
+        if (x >= rc.right - S(d, 18) && ThumbGeom(d, &t, &top, &h)) {
+            if (y >= t.top && y < t.bottom) {
+                d->drag = TRUE;
+                d->grab = y - t.top;
+                SetCapture(hwnd);
+            } else {  // click on the track: a page up or down
+                d->scroll += (y < t.top ? -1 : 1) * h * 9 / 10;
+                d->scroll = max(0, d->scroll);
+                Frame(d);
+            }
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (d->drag) {
+            RECT t;
+            int top, h, y = (short)HIWORD(lp);
+            if (ThumbGeom(d, &t, &top, &h)) {
+                int range = h - (t.bottom - t.top);
+                d->scroll = range > 0 ? max(0, (y - d->grab - top) * (d->content - h) / range) : 0;
+                Frame(d);
+            }
+        }
+        return 0;
+    case WM_LBUTTONUP:
+    case WM_CAPTURECHANGED:
+        if (d->drag) {
+            d->drag = FALSE;
+            if (GetCapture() == hwnd)
+                ReleaseCapture();
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
     case WM_ERASEBKGND:
         return 1;
     case WM_SIZE:
@@ -882,7 +1107,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND: {
         BOOL isPause = FALSE;
         Op *o = OpOfButton(d, (HWND)lp, &isPause);
-        if (LOWORD(wp) == ID_DETAILS) {
+        Op *ask = NULL;
+        for (int i = 0; i < d->n && !ask; i++)
+            for (int k = 0; k < 3; k++)
+                if (d->ops[i]->cbtn[k] && d->ops[i]->cbtn[k] == (HWND)lp)
+                    ask = d->ops[i];
+        if (ask) {
+            InterlockedExchange(&ask->prog->conflictChoice, LOWORD(wp) - ID_CONFLICT);
+            ask->prog->conflictPending = 0;
+            StartFrames(d);
+        } else if (LOWORD(wp) == ID_DETAILS) {
             ToggleDetails(d);
             InvalidateRect(d->details, NULL, FALSE);
         } else if (o && isPause) {
@@ -913,6 +1147,124 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+#define DM_SIZE 1000     // touchpad viewport
+#define DM_TALL 200000   // content far taller than the viewport, so a pan never reaches its edge and bounces;
+                         // it starts in the middle and is put back there after every pan
+static const GUID kClsidDm = { 0x54E211B6, 0x3650, 0x4F75, { 0x83, 0x34, 0xFA, 0x35, 0x95, 0x98, 0xE1, 0xC5 } };
+static const GUID kIidDm = { 0xFBF5D3B4, 0x70C7, 0x4163, { 0x93, 0x22, 0x5A, 0x6F, 0x66, 0x0D, 0x6F, 0xBC } };
+static const GUID kIidDmUpdate = { 0xB0AE62FD, 0xBE34, 0x46E7, { 0x9C, 0xAA, 0xD3, 0x61, 0xFA, 0xCB, 0xB9, 0xCC } };
+static const GUID kIidDmView = { 0x28B85A3D, 0x60A0, 0x48BD, { 0x9B, 0xA1, 0x5C, 0xE8, 0xD9, 0xEA, 0x3A, 0x6D } };
+static const GUID kIidDmContent = { 0xB89962CB, 0x3D89, 0x442B, { 0xBB, 0x58, 0x50, 0x98, 0xFA, 0x0F, 0x9F, 0x16 } };
+static const GUID kIidDmHandler = { 0x952121DA, 0xD69F, 0x45F9, { 0xB0, 0xF9, 0xF2, 0x39, 0x44, 0x32, 0x1A, 0x6D } };
+
+static void DmRecentre(Dlg *d)
+{
+    d->dmY = -(float)(DM_TALL / 2);  // the content offset ZoomToRect leaves
+    d->dmRem = 0;
+    IDirectManipulationViewport_ZoomToRect(d->dmView, 0, DM_TALL / 2, DM_SIZE, DM_TALL / 2 + DM_SIZE, FALSE);
+}
+
+static HRESULT STDMETHODCALLTYPE DmQueryInterface(IDirectManipulationViewportEventHandler *self, REFIID riid, void **out)
+{
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &kIidDmHandler)) {
+        *out = self;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE DmRef(IDirectManipulationViewportEventHandler *self) { (void)self; return 1; }  // static object
+
+static HRESULT STDMETHODCALLTYPE DmStatus(IDirectManipulationViewportEventHandler *self, IDirectManipulationViewport *view,
+                                          DIRECTMANIPULATION_STATUS now, DIRECTMANIPULATION_STATUS before)
+{
+    (void)self;
+    (void)before;
+    (void)view;
+    Dlg *d = &gDlg;
+    d->dmActive = now == DIRECTMANIPULATION_RUNNING || now == DIRECTMANIPULATION_INERTIA;
+    if (d->dmActive) {
+        StartFrames(d);
+    } else if (now == DIRECTMANIPULATION_READY) {  // pan and inertia done: back to the middle for the next one
+        DmRecentre(d);
+    }
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE DmUpdated(IDirectManipulationViewportEventHandler *self, IDirectManipulationViewport *view)
+{
+    (void)self;
+    (void)view;
+    return S_OK;
+}
+
+// The content offset is where the fingers dragged it; the list scrolls by how much that changed.
+static HRESULT STDMETHODCALLTYPE DmContent(IDirectManipulationViewportEventHandler *self, IDirectManipulationViewport *view,
+                                           IDirectManipulationContent *content)
+{
+    (void)self;
+    (void)view;
+    Dlg *d = &gDlg;
+    float m[6];
+    if (FAILED(IDirectManipulationContent_GetContentTransform(content, m, 6)))
+        return S_OK;
+    d->dmRem += m[5] - d->dmY;
+    d->dmY = m[5];
+    int px = (int)d->dmRem;
+    d->dmRem -= px;
+    d->scroll = max(0, d->scroll - px);  // Frame clamps the far end
+    return S_OK;
+}
+
+static IDirectManipulationViewportEventHandlerVtbl kDmVtbl = { DmQueryInterface, DmRef, DmRef, DmStatus, DmUpdated, DmContent };
+static IDirectManipulationViewportEventHandler kDmHandler = { &kDmVtbl };
+
+static void DmInit(Dlg *d)
+{
+    RECT r = { 0, 0, DM_SIZE, DM_SIZE }, tall = { 0, 0, DM_SIZE, DM_TALL };
+    IDirectManipulationContent *content = NULL;
+    if (FAILED(CoCreateInstance(&kClsidDm, NULL, CLSCTX_INPROC_SERVER, &kIidDm, (void **)&d->dm)) ||
+        FAILED(IDirectManipulationManager_GetUpdateManager(d->dm, &kIidDmUpdate, (void **)&d->dmUpdate)) ||
+        FAILED(IDirectManipulationManager_CreateViewport(d->dm, NULL, d->hwnd, &kIidDmView, (void **)&d->dmView)) ||
+        FAILED(IDirectManipulationViewport_ActivateConfiguration(d->dmView, DIRECTMANIPULATION_CONFIGURATION_INTERACTION |
+                                                                                DIRECTMANIPULATION_CONFIGURATION_TRANSLATION_Y |
+                                                                                DIRECTMANIPULATION_CONFIGURATION_TRANSLATION_INERTIA |
+                                                                                DIRECTMANIPULATION_CONFIGURATION_RAILS_Y)) ||
+        FAILED(IDirectManipulationViewport_SetViewportOptions(d->dmView, DIRECTMANIPULATION_VIEWPORT_OPTIONS_MANUALUPDATE)) ||
+        FAILED(IDirectManipulationViewport_AddEventHandler(d->dmView, d->hwnd, &kDmHandler, &d->dmCookie)) ||
+        FAILED(IDirectManipulationViewport_SetViewportRect(d->dmView, &r)) ||
+        FAILED(IDirectManipulationViewport_GetPrimaryContent(d->dmView, &kIidDmContent, (void **)&content)) ||
+        FAILED(IDirectManipulationContent_SetContentRect(content, &tall)) ||
+        FAILED(IDirectManipulationManager_Activate(d->dm, d->hwnd)) ||
+        FAILED(IDirectManipulationViewport_Enable(d->dmView))) {
+        FcLog(L"DirectManipulation unavailable: touchpad scrolling off");
+        if (content)
+            IDirectManipulationContent_Release(content);
+        return;  // the wheel and the scroll thumb still work
+    }
+    IDirectManipulationContent_Release(content);
+    DmRecentre(d);
+    IDirectManipulationUpdateManager_Update(d->dmUpdate, NULL);
+}
+
+static void DmFree(Dlg *d)
+{
+    if (d->dmView) {
+        IDirectManipulationViewport_Stop(d->dmView);
+        if (d->dmCookie)
+            IDirectManipulationViewport_RemoveEventHandler(d->dmView, d->dmCookie);
+        IDirectManipulationViewport_Abandon(d->dmView);
+        IDirectManipulationViewport_Release(d->dmView);
+    }
+    if (d->dm) {
+        IDirectManipulationManager_Deactivate(d->dm, d->hwnd);
+        IDirectManipulationManager_Release(d->dm);
+    }
+    if (d->dmUpdate)
+        IDirectManipulationUpdateManager_Release(d->dmUpdate);
 }
 
 static BOOL CreateDlgWindow(Dlg *d)
@@ -955,6 +1307,7 @@ static BOOL CreateDlgWindow(Dlg *d)
         ITaskbarList3_Release(d->taskbar);
         d->taskbar = NULL;
     }
+    DmInit(d);
     SetTimer(d->hwnd, TIMER_TICK, TICK_MS, NULL);
     return TRUE;
 }
@@ -965,6 +1318,7 @@ static void DestroyDlgWindow(Dlg *d)
         ITaskbarList3_SetProgressState(d->taskbar, d->hwnd, TBPF_NOPROGRESS);
         ITaskbarList3_Release(d->taskbar);
     }
+    DmFree(d);
     DestroyWindow(d->hwnd);  // children and the tooltip go with it
     HFONT fonts[] = { d->font, d->fontTitle, d->fontKpi, d->fontChevron, d->fontGlyph };
     for (int i = 0; i < 5; i++)
@@ -984,6 +1338,7 @@ static void AddOp(Dlg *d, Op *o)
     o->pause = IconButton(d, L"Pausar");
     o->cancel = IconButton(d, L"Cancelar");
     d->ops[d->n++] = o;
+    o->added = TRUE;
     if (fresh) {
         d->h = LayoutHeight(d);
         ApplyHeight(d);
@@ -1002,8 +1357,13 @@ static void RemoveOp(Dlg *d, Op *o)
         return;
     SetTip(d, o->pause, L"", TTM_DELTOOLW);
     SetTip(d, o->cancel, L"", TTM_DELTOOLW);
+    if (o->meterBmp)
+        DeleteObject(o->meterBmp);
     DestroyWindow(o->pause);
     DestroyWindow(o->cancel);
+    for (int k = 0; k < 3; k++)
+        if (o->cbtn[k])
+            DestroyWindow(o->cbtn[k]);
     memmove(&d->ops[i], &d->ops[i + 1], (d->n - i - 1) * sizeof(Op *));
     d->n--;
     if (!d->n)
@@ -1070,12 +1430,59 @@ static BOOL CALLBACK StartUi(PINIT_ONCE once, PVOID param, PVOID *ctx)
     return TRUE;
 }
 
+static FcConflictChoice AskConflictDialog(int count, PCWSTR example);
+
+// One question per operation. The progress window shows it inside the operation's panel; this thread
+// just publishes it and polls for the answer (the UI thread sets conflictChoice, or the user cancels).
+static FcConflictChoice AskConflict(FcProgress *prog, int count, PCWSTR example)
+{
+    if (!prog->conflictEvent)
+        return AskConflictDialog(count, example);
+    wcscpy_s(prog->conflictExample, MAX_PATH, example);
+    prog->conflictCount = count;
+    prog->conflictChoice = -1;
+    prog->conflictPending = 1;
+    SetEvent(prog->conflictEvent);
+    while (prog->conflictChoice < 0 && !prog->cancel)
+        Sleep(30);
+    LONG c = prog->conflictChoice;
+    prog->conflictPending = 0;
+    return c < 0 ? FC_CONFLICT_CANCEL : (FcConflictChoice)c;
+}
+
 typedef struct {
     const FcItem *items;
     int n;
     FcProgress *prog;
     FcResult res;
 } Work;
+
+// Fallback when there is no window to ask in.
+static FcConflictChoice AskConflictDialog(int count, PCWSTR example)
+{
+    WCHAR head[256];
+    if (count == 1)
+        swprintf_s(head, 256, L"El destino ya tiene un archivo llamado «%s»", PathFindFileNameW(example));
+    else
+        swprintf_s(head, 256, L"El destino ya tiene %d archivos con el mismo nombre", count);
+    TASKDIALOG_BUTTON links[] = {
+        { 100, L"Reemplazar los archivos en el destino" },
+        { 101, L"Omitir estos archivos" },
+        { 102, L"Conservar ambos archivos\nSe añadirá un número al nombre de los que ya existían." },
+    };
+    TASKDIALOGCONFIG cfg = { sizeof(cfg) };
+    cfg.dwFlags = TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION;
+    cfg.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    cfg.pszWindowTitle = L"Reemplazar u omitir archivos";
+    cfg.pszMainInstruction = head;
+    cfg.pszContent = example;
+    cfg.pButtons = links;
+    cfg.cButtons = 3;
+    int id = IDCANCEL;
+    if (FAILED(TaskDialogIndirect(&cfg, &id, NULL, NULL)))
+        return FC_CONFLICT_CANCEL;
+    return id == 100 ? FC_CONFLICT_REPLACE : id == 101 ? FC_CONFLICT_SKIP : id == 102 ? FC_CONFLICT_BOTH : FC_CONFLICT_CANCEL;
+}
 
 static DWORD WINAPI Worker(LPVOID arg)
 {
@@ -1087,11 +1494,20 @@ static DWORD WINAPI Worker(LPVOID arg)
 FcResult RunWithProgress(const FcItem *items, int n, FcProgress *prog)
 {
     Work work = { items, n, prog, FC_ERROR };
+    prog->onConflict = AskConflict;
+    prog->conflictEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
     HANDLE th = CreateThread(NULL, 0, Worker, &work, 0, NULL);
-    if (!th)
-        return FcRun(items, n, prog);
+    if (!th) {
+        FcResult r = FcRun(items, n, prog);
+        if (prog->conflictEvent)
+            CloseHandle(prog->conflictEvent);
+        return r;
+    }
 
-    if (WaitForSingleObject(th, SHOW_DELAY_MS) == WAIT_TIMEOUT) {
+    // The window appears after a short delay, or at once if the engine has a question to ask.
+    HANDLE wait[2] = { th, prog->conflictEvent };
+    DWORD r = WaitForMultipleObjects(prog->conflictEvent ? 2 : 1, wait, FALSE, SHOW_DELAY_MS);
+    if (r != WAIT_OBJECT_0) {
         InitOnceExecuteOnce(&gUiOnce, StartUi, NULL, NULL);
         Op *o = gMgr ? calloc(1, sizeof(Op)) : NULL;  // ~1 KB of samples: off Explorer's thread stack
         if (o) {
@@ -1106,7 +1522,13 @@ FcResult RunWithProgress(const FcItem *items, int n, FcProgress *prog)
             // arrive after this op's remove and leave the UI holding freed memory.
             SendMessageW(gMgr, WM_FC_ADD, 0, (LPARAM)o);
         }
-        WaitForSingleObject(th, INFINITE);
+        BOOL ui = o && o->added;
+        for (BOOL asked = r == WAIT_OBJECT_0 + 1;; asked = TRUE) {
+            if (asked && !ui && prog->conflictPending)  // no window to ask in: use a dialog
+                prog->conflictChoice = AskConflictDialog(prog->conflictCount, prog->conflictExample);
+            if (WaitForMultipleObjects(prog->conflictEvent ? 2 : 1, wait, FALSE, INFINITE) == WAIT_OBJECT_0)
+                break;
+        }
         if (o) {
             SendMessageW(gMgr, WM_FC_REMOVE, 0, (LPARAM)o);  // returns once the UI thread let go of it
             free(o);
@@ -1114,5 +1536,7 @@ FcResult RunWithProgress(const FcItem *items, int n, FcProgress *prog)
     }
     WaitForSingleObject(th, INFINITE);
     CloseHandle(th);
+    if (prog->conflictEvent)
+        CloseHandle(prog->conflictEvent);
     return work.res;
 }

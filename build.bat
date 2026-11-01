@@ -15,6 +15,8 @@ cl /nologo /utf-8 /O2 /W3 /MT /LD /Fo"%ROOT%obj\\" /Fe"%ROOT%bin\fc_hook.dll" /I
 
 cl /nologo /utf-8 /O2 /W3 /MT /Fo"%ROOT%obj\\" /Fe"%ROOT%bin\engine_test.exe" "%ROOT%tests\engine_test.c" %ENGINE% %LIBS% || exit /b 1
 
+cl /nologo /utf-8 /O2 /W3 /MT /Fo"%ROOT%obj\\" /Fe"%ROOT%bin\ui_demo.exe" "%ROOT%tests\ui_demo.c" "%ROOT%src\hook\ui.c" %ENGINE% %LIBS% || exit /b 1
+
 cl /nologo /utf-8 /O2 /W3 /MT /Fo"%ROOT%obj\\" /Fe"%ROOT%bin\fc_agent.exe" "%ROOT%src\agent\agent.c" "%ROOT%src\engine\log.c" ^
   shlwapi.lib /link /SUBSYSTEM:WINDOWS || exit /b 1
 echo BUILD OK

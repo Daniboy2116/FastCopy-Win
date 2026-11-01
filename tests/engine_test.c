@@ -58,6 +58,55 @@ static void BuildTree(PCWSTR root)
     Path(p, root, L"dst"); CreateDirectoryW(p, NULL);
 }
 
+static FcConflictChoice gChoice;
+static int gAsked;
+static FcConflictChoice Ask(FcProgress *pr, int count, PCWSTR example) { (void)pr; (void)count; (void)example; gAsked++; return gChoice; }
+
+// Existing targets: resolved by the callback (replace / skip / keep both / cancel), folders merge.
+static void ConflictSuite(PCWSTR root, PCWSTR otherRoot)
+{
+    WCHAR one[MAX_PATH], tree[MAX_PATH], dst[MAX_PATH], a[MAX_PATH], b[MAX_PATH];
+    Path(one, root, L"src\\single.txt");
+    Path(tree, root, L"src\\tree");
+    Path(dst, otherRoot, L"dst");
+    FcProgress pr;
+    FcItem item = { FALSE, one, dst, NULL };
+    Path(a, otherRoot, L"dst\\single.txt");
+    CHECK(FcRun(&item, 1, Reset(&pr)) == FC_OK);
+    WriteFileText(one, "single changed", 0);
+
+    CHECK(FcRun(&item, 1, Reset(&pr)) == FC_FALLBACK);  // no callback: Windows decides
+
+    Reset(&pr)->onConflict = Ask;
+    gAsked = 0;
+    gChoice = FC_CONFLICT_CANCEL;
+    CHECK(FcRun(&item, 1, &pr) == FC_CANCELLED && gAsked == 1);
+    gChoice = FC_CONFLICT_SKIP;
+    CHECK(FcRun(&item, 1, Reset(&pr)) == FC_FALLBACK);  // Reset cleared the callback
+    Reset(&pr)->onConflict = Ask;
+    CHECK(FcRun(&item, 1, &pr) == FC_OK && pr.filesTotal == 0);
+    CHECK(!SameContent(one, a));
+    gChoice = FC_CONFLICT_BOTH;
+    Reset(&pr)->onConflict = Ask;
+    CHECK(FcRun(&item, 1, &pr) == FC_OK);
+    Path(b, otherRoot, L"dst\\single (2).txt");
+    CHECK(Exists(b) && SameContent(one, b) && !SameContent(one, a));
+    gChoice = FC_CONFLICT_REPLACE;
+    Reset(&pr)->onConflict = Ask;
+    SetFileAttributesW(a, FILE_ATTRIBUTE_READONLY);
+    CHECK(FcRun(&item, 1, &pr) == FC_OK && SameContent(one, a));
+
+    // folder onto an existing folder merges: every file already there is a conflict
+    FcItem folder = { FALSE, tree, dst, NULL };
+    CHECK(FcRun(&folder, 1, Reset(&pr)) == FC_OK);
+    gChoice = FC_CONFLICT_SKIP;
+    Reset(&pr)->onConflict = Ask;
+    CHECK(FcRun(&folder, 1, &pr) == FC_OK && pr.filesTotal == 0 && gAsked > 0);
+    gChoice = FC_CONFLICT_REPLACE;
+    Reset(&pr)->onConflict = Ask;
+    CHECK(FcRun(&folder, 1, &pr) == FC_OK && pr.filesTotal == 52);
+}
+
 static void RunSuite(PCWSTR root, PCWSTR otherRoot)
 {
     WCHAR src[MAX_PATH], dst[MAX_PATH], a[MAX_PATH], b[MAX_PATH];
@@ -135,6 +184,11 @@ int wmain(void)
     RunSuite(root, root);
     Nuke(root);
 
+    CreateDirectoryW(root, NULL);
+    BuildTree(root);
+    ConflictSuite(root, root);
+    Nuke(root);
+
     if (GetDriveTypeW(L"D:\\") == DRIVE_FIXED) {
         WCHAR other[MAX_PATH];
         swprintf_s(other, MAX_PATH, L"D:\\fc_test_%llu", GetTickCount64());
@@ -144,6 +198,14 @@ int wmain(void)
         BuildTree(root);
         Path(tmp, other, L"dst"); CreateDirectoryW(tmp, NULL);
         RunSuite(root, other);
+        Nuke(root);
+        Nuke(other);
+
+        CreateDirectoryW(root, NULL);
+        CreateDirectoryW(other, NULL);
+        BuildTree(root);
+        Path(tmp, other, L"dst"); CreateDirectoryW(tmp, NULL);
+        ConflictSuite(root, other);
         Nuke(root);
         Nuke(other);
     }

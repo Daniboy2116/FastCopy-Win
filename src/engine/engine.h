@@ -11,16 +11,26 @@ typedef struct {
 
 enum { FC_PHASE_PLAN, FC_PHASE_COPY, FC_PHASE_FINISH };
 
+// What to do with files that already exist at the destination (asked once per operation).
+typedef enum { FC_CONFLICT_REPLACE, FC_CONFLICT_SKIP, FC_CONFLICT_BOTH, FC_CONFLICT_CANCEL } FcConflictChoice;
+typedef struct FcProgress FcProgress;
+typedef FcConflictChoice (*FcConflictFn)(FcProgress *prog, int count, PCWSTR example);
+
 // Shared between the engine (writer) and the progress window (reader). Zero-initialize.
-typedef struct {
+struct FcProgress {
     volatile LONG64 bytesDone;
     volatile LONG64 bytesTotal;  // known after planning; moves count their verify pass too
     volatile LONG filesDone, filesTotal;
     volatile LONG phase;
     volatile LONG cancel, paused;  // set by the UI
+    FcConflictFn onConflict;       // NULL: any existing target falls back to Windows
     SRWLOCK lock;                  // guards `current`
     WCHAR current[MAX_PATH];
-} FcProgress;
+    // Conflict hand-off between the engine thread (asks, then polls conflictChoice) and the UI (answers).
+    HANDLE conflictEvent;  // signalled by the engine when it starts asking; optional
+    volatile LONG conflictPending, conflictChoice, conflictCount;  // choice: -1 until answered, else FcConflictChoice
+    WCHAR conflictExample[MAX_PATH];
+};
 
 typedef enum {
     FC_OK,         // everything copied/moved

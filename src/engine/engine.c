@@ -6,18 +6,22 @@
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <wctype.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "engine.h"
 
 #define BIG_FILE (256ull * 1024 * 1024)  // above this, copy without the system cache
 #define MAX_WORKERS 8
 #define VERIFY_BLOCK (1024 * 1024)
 
-enum { J_RENAME, J_MKDIR, J_COPY };
+enum { J_RENAME, J_MKDIR, J_COPY, J_SKIP };
 
 typedef struct {
     int kind;
     BOOL fromMove;
     BOOL done;  // copied (and verified, for moves)
+    BOOL conflict, replace;  // J_COPY onto an existing file / overwrite it
+    BOOL exists;             // J_MKDIR onto an existing folder (merge)
     PWSTR src, dst;
     ULONGLONG size;
 } Job;
@@ -25,6 +29,9 @@ typedef struct {
 typedef struct {
     Job *v;
     int n, cap;
+    BOOL allow;  // conflicts can be resolved (a callback is set); otherwise they fall back
+    int nconf;
+    WCHAR firstConf[MAX_PATH];
 } Plan;
 
 static PWSTR Join(PCWSTR a, PCWSTR b)
@@ -53,6 +60,23 @@ static BOOL Push(Plan *p, int kind, BOOL fromMove, PCWSTR src, PCWSTR dst, ULONG
     j->kind = kind;
     j->fromMove = fromMove;
     j->done = FALSE;
+    j->conflict = j->replace = j->exists = FALSE;
+    DWORD da = GetFileAttributesW(dst);
+    if (da != INVALID_FILE_ATTRIBUTES) {
+        BOOL dir = (da & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (!p->allow || (da & FILE_ATTRIBUTE_REPARSE_POINT) || dir != (kind == J_MKDIR) || kind == J_RENAME) {
+            FcLog(L"fallback: target exists %s", dst);  // Windows shows its replace/skip dialog
+            p->n--;
+            return FALSE;
+        }
+        if (kind == J_MKDIR) {
+            j->exists = TRUE;
+        } else {
+            j->conflict = TRUE;
+            if (!p->nconf++)
+                wcscpy_s(p->firstConf, MAX_PATH, dst);
+        }
+    }
     j->src = _wcsdup(src);
     j->dst = _wcsdup(dst);
     j->size = size;
@@ -113,8 +137,12 @@ static BOOL PlanItem(Plan *p, const FcItem *it, FcProgress *prog)
     size_t ls = wcslen(it->src);
     BOOL ok = FALSE;
 
-    if (GetFileAttributesW(dst) != INVALID_FILE_ATTRIBUTES) {
-        FcLog(L"fallback: target exists %s", dst);  // Windows shows its replace/skip dialog
+    if (attr == INVALID_FILE_ATTRIBUTES && GetFileAttributesW(dst) != INVALID_FILE_ATTRIBUTES) {
+        FcLog(L"fallback: target exists %s", dst);
+    } else if (!_wcsicmp(it->src, dst)) {
+        FcLog(L"fallback: copy onto itself %s", dst);  // Windows makes "name - Copia"
+    } else if (GetFileAttributesW(dst) != INVALID_FILE_ATTRIBUTES && it->move && SameVolume(it->src, it->dstDir)) {
+        FcLog(L"fallback: target exists %s", dst);  // same-volume move onto an existing name
     } else if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
         FcLog(L"fallback: source missing or reparse point %s", it->src);
     } else if ((attr & FILE_ATTRIBUTE_DIRECTORY) && !_wcsnicmp(dst, it->src, ls) && dst[ls] == L'\\') {
@@ -130,6 +158,45 @@ static BOOL PlanItem(Plan *p, const FcItem *it, FcProgress *prog)
     }
     free(dst);
     return ok;
+}
+
+// "name.ext" -> "name (2).ext", the first one that is free.
+static PWSTR UniqueName(PCWSTR path)
+{
+    PCWSTR ext = PathFindExtensionW(path);
+    size_t base = ext - path;
+    PWSTR r = malloc((wcslen(path) + 16) * sizeof(WCHAR));
+    for (int n = 2;; n++) {
+        swprintf_s(r, wcslen(path) + 16, L"%.*s (%d)%s", (int)base, path, n, ext);
+        if (GetFileAttributesW(r) == INVALID_FILE_ATTRIBUTES)
+            return r;
+    }
+}
+
+// Applies the user's answer to every conflicting file. FALSE: the operation was cancelled.
+static BOOL ResolveConflicts(Plan *p, FcProgress *prog)
+{
+    if (!p->nconf)
+        return TRUE;
+    FcConflictChoice c = prog->onConflict(prog, p->nconf, p->firstConf);
+    if (c == FC_CONFLICT_CANCEL)
+        return FALSE;
+    for (int i = 0; i < p->n; i++) {
+        Job *j = &p->v[i];
+        if (!j->conflict)
+            continue;
+        if (c == FC_CONFLICT_SKIP) {
+            j->kind = J_SKIP;
+        } else if (c == FC_CONFLICT_BOTH) {
+            PWSTR u = UniqueName(j->dst);
+            free(j->dst);
+            j->dst = u;
+            j->conflict = FALSE;
+        } else {
+            j->replace = TRUE;
+        }
+    }
+    return TRUE;
 }
 
 // Blocks while paused; FALSE once cancelled.
@@ -152,13 +219,35 @@ typedef struct {
     ULONGLONG reported;
 } ChunkCtx;
 
+// Test aid: %TEMP%astcopy_slow holding N throttles every file stream to N MB/s, so the UI can be watched on fast disks.
+static ULONGLONG gSlowBps;
+
+static void LoadSlow(void)
+{
+    WCHAR p[MAX_PATH];
+    char buf[16] = "";
+    DWORD got = 0;
+    gSlowBps = 0;
+    GetTempPathW(MAX_PATH, p);
+    wcscat_s(p, MAX_PATH, L"fastcopy_slow");
+    HANDLE h = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+    ReadFile(h, buf, sizeof(buf) - 1, &got, NULL);
+    CloseHandle(h);
+    gSlowBps = (ULONGLONG)atoi(buf) * 1024 * 1024;
+}
+
 static COPYFILE2_MESSAGE_ACTION CALLBACK OnChunk(const COPYFILE2_MESSAGE *m, PVOID arg)
 {
     ChunkCtx *cc = arg;
     if (m->Type == COPYFILE2_CALLBACK_CHUNK_FINISHED) {
         ULONGLONG total = m->Info.ChunkFinished.uliTotalBytesTransferred.QuadPart;
-        InterlockedAdd64(&cc->prog->bytesDone, (LONG64)(total - cc->reported));
+        ULONGLONG delta = total - cc->reported;
+        InterlockedAdd64(&cc->prog->bytesDone, (LONG64)delta);
         cc->reported = total;
+        if (gSlowBps)
+            Sleep((DWORD)(delta * 1000 / gSlowBps));
     }
     return WaitIfPaused(cc->prog) ? COPYFILE2_PROGRESS_CONTINUE : COPYFILE2_PROGRESS_CANCEL;
 }
@@ -210,7 +299,9 @@ static DWORD WINAPI CopyWorker(LPVOID arg)
 
         ChunkCtx cc = { c->prog, 0 };
         COPYFILE2_EXTENDED_PARAMETERS ep = { sizeof(ep) };
-        ep.dwCopyFlags = COPY_FILE_FAIL_IF_EXISTS | (j->size >= BIG_FILE ? COPY_FILE_NO_BUFFERING : 0);
+        if (j->replace)
+            SetFileAttributesW(j->dst, FILE_ATTRIBUTE_NORMAL);  // a read-only target would refuse the overwrite
+        ep.dwCopyFlags = (j->replace ? 0 : COPY_FILE_FAIL_IF_EXISTS) | (j->size >= BIG_FILE ? COPY_FILE_NO_BUFFERING : 0);
         ep.pProgressRoutine = OnChunk;
         ep.pvCallbackContext = &cc;
         HRESULT hr = CopyFile2(j->src, j->dst, &ep);
@@ -301,6 +392,8 @@ FcResult FcRun(const FcItem *items, int n, FcProgress *prog)
     ULONGLONG bytes = 0;
     int i, ncopy = 0;
 
+    LoadSlow();
+    p.allow = prog->onConflict != NULL;
     prog->phase = FC_PHASE_PLAN;
     for (i = 0; i < n; i++) {
         BOOL ok = PlanItem(&p, &items[i], prog);
@@ -310,6 +403,10 @@ FcResult FcRun(const FcItem *items, int n, FcProgress *prog)
         }
         if (!ok)
             goto out;
+    }
+    if (!ResolveConflicts(&p, prog)) {
+        res = FC_CANCELLED;
+        goto out;
     }
     for (i = 0; i < p.n; i++)
         if (p.v[i].kind == J_COPY) {
@@ -342,7 +439,7 @@ FcResult FcRun(const FcItem *items, int n, FcProgress *prog)
             FcLog(L"rename failed (%lu) %s", GetLastError(), j->src);
             goto out;
         }
-        if (j->kind == J_MKDIR && !CreateDirectoryExW(j->src, j->dst, NULL)) {
+        if (j->kind == J_MKDIR && !j->exists && !CreateDirectoryExW(j->src, j->dst, NULL)) {
             FcLog(L"mkdir failed (%lu) %s", GetLastError(), j->dst);
             goto out;
         }
