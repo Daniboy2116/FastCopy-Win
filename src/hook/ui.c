@@ -180,6 +180,28 @@ static double RealFrac(Op *o)
     return tot > 0 ? Clamp01((double)o->prog->bytesDone / tot) : 0;
 }
 
+static int CALLBACK FontFound(const LOGFONTW *lf, const TEXTMETRICW *tm, DWORD type, LPARAM found)
+{
+    (void)lf;
+    (void)tm;
+    (void)type;
+    *(BOOL *)found = TRUE;
+    return 0;
+}
+
+// Windows 11's icon font; Windows 10 and Server 2019/2022 have its predecessor, with the same code points.
+static PCWSTR IconFont(void)
+{
+    LOGFONTW lf = { 0 };
+    lf.lfCharSet = DEFAULT_CHARSET;
+    wcscpy_s(lf.lfFaceName, LF_FACESIZE, L"Segoe Fluent Icons");
+    BOOL found = FALSE;
+    HDC dc = GetDC(NULL);
+    EnumFontFamiliesExW(dc, &lf, FontFound, (LPARAM)&found, 0);
+    ReleaseDC(NULL, dc);
+    return found ? L"Segoe Fluent Icons" : L"Segoe MDL2 Assets";
+}
+
 static void LoadFonts(Dlg *d)
 {
     NONCLIENTMETRICSW ncm = { sizeof(ncm) };
@@ -196,7 +218,7 @@ static void LoadFonts(Dlg *d)
     lf.lfHeight = ncm.lfMessageFont.lfHeight * 5 / 3;
     d->fontKpi = CreateFontIndirectW(&lf);
     lf = ncm.lfMessageFont;
-    wcscpy_s(lf.lfFaceName, LF_FACESIZE, L"Segoe Fluent Icons");
+    wcscpy_s(lf.lfFaceName, LF_FACESIZE, IconFont());
     lf.lfHeight = ncm.lfMessageFont.lfHeight * 5 / 6;
     d->fontChevron = CreateFontIndirectW(&lf);
     lf.lfHeight = -S(d, 16);
@@ -1294,7 +1316,8 @@ static BOOL CreateDlgWindow(Dlg *d)
     if (!d->hwnd)
         return FALSE;
     BOOL dark = d->dark;
-    DwmSetWindowAttribute(d->hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    if (FAILED(DwmSetWindowAttribute(d->hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark))))
+        DwmSetWindowAttribute(d->hwnd, 19, &dark, sizeof(dark));  // its number before Windows 10 20H1 (1809-1909, Server 2019)
     d->tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
                              CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, d->hwnd, NULL, gInst, NULL);
     d->details = CreateWindowExW(0, L"BUTTON", d->expanded ? L"Menos detalles" : L"Más detalles",

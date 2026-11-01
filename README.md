@@ -60,7 +60,8 @@ Ambas copias con el origen en caché y verificadas: mismos archivos y mismos byt
 
 ## Requisitos
 
-- Windows 11 x64. Probado en 24H2 (build 26100). En otras versiones debería funcionar, porque usa una interfaz pública, pero no está probado.
+- Windows 10 (1809 o posterior) u 11, x64, con Explorador (también Windows Server 2019/2022/2025 con experiencia de escritorio). Probado solo en Windows 11 24H2 (build 26100); en el resto debería funcionar porque usa una interfaz pública, pero no está probado.
+- No funciona en Windows en ARM (MinHook no soporta ARM64) ni con Smart App Control en modo "Activado" (bloquea DLL sin firmar).
 - Para compilar: Visual Studio 2022 Build Tools con el componente de C++ (MSVC) y el Windows SDK.
 - Permisos de administrador solo para instalar (copiar a `Program Files`).
 
