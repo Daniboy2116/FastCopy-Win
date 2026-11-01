@@ -26,12 +26,12 @@ Ambas copias con el origen en caché y verificadas: mismos archivos y mismos byt
 - **Ventana de progreso** estilo Windows 11 (tema claro/oscuro, color de acento) con velocidad, tiempo restante, botones de icono para **pausar/reanudar** y **cancelar** cada operación, y progreso en el icono de la barra de tareas. Solo aparece si la operación dura más de medio segundo.
 - **Varias operaciones en una sola ventana**, como en Windows: un panel por copia o movimiento, cada uno con su propia gráfica, que entra y sale con animación. Si no caben, la lista se desplaza con la rueda, el touchpad (con DirectManipulation, como las vistas del Explorador) o arrastrando la barra.
 - **Archivos que ya existen en el destino:** el panel de la operación pregunta una vez qué hacer con todos: **Reemplazar**, **Omitir** o **Conservar ambos** (añade " (2)" al nombre). Las carpetas con el mismo nombre se combinan.
+- **Rutas largas:** copia y mueve carpetas anidadas más allá de los 260 caracteres de Windows (hasta unos 32.000).
 - **Más detalles:** la barra de progreso se transforma en una gráfica de velocidad de toda la operación (con media y máxima), y aparecen elementos procesados y restantes, datos, tiempo transcurrido y restante, y la ruta. Recuerda si lo dejaste abierto. Las animaciones respetan la opción "Efectos de animación" de Windows.
 - **Si no lo tiene claro, se lo deja a Windows.** Antes de escribir nada, FastCopy planifica toda la operación. Si encuentra algo que no maneja, no toca nada y la copia la hace Windows como siempre:
   - copiar en la misma carpeta (Windows crea "nombre - Copia"), mover dentro del mismo disco sobre un nombre que ya existe, o un archivo contra una carpeta del mismo nombre,
   - rutas de red, móviles, ZIP y otras carpetas virtuales,
   - enlaces simbólicos y puntos de unión,
-  - rutas de más de 260 caracteres,
   - falta de espacio en el destino,
   - operaciones que mezclan copiar con borrar, renombrar, etc.
 
@@ -177,7 +177,6 @@ uninstall.ps1      lo quita todo
 
 ## Pendiente
 
-- Rutas de más de 260 caracteres (ahora las copia Windows).
 - Decidir archivo por archivo en los conflictos (ahora es una respuesta para toda la operación).
 - Verificación también en copias (ahora solo se verifica al mover).
 - Probar en Windows 10 y en otras versiones de Windows 11 (ver [Compatibilidad](#compatibilidad)).

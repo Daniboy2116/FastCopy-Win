@@ -1536,11 +1536,11 @@ FcResult RunWithProgress(const FcItem *items, int n, FcProgress *prog)
         if (o) {
             o->prog = prog;
             o->move = items[0].move;
-            wcscpy_s(o->destName, MAX_PATH, PathFindFileNameW(items[0].dstDir));
-            wcscpy_s(o->dstDir, MAX_PATH, items[0].dstDir);
-            wcscpy_s(o->srcDir, MAX_PATH, items[0].src);
+            wcsncpy_s(o->destName, MAX_PATH, PathFindFileNameW(items[0].dstDir), _TRUNCATE);
+            wcsncpy_s(o->dstDir, MAX_PATH, items[0].dstDir, _TRUNCATE);
+            wcsncpy_s(o->srcDir, MAX_PATH, items[0].src, _TRUNCATE);
             PathRemoveFileSpecW(o->srcDir);
-            wcscpy_s(o->srcName, MAX_PATH, PathFindFileNameW(o->srcDir));
+            wcsncpy_s(o->srcName, MAX_PATH, PathFindFileNameW(o->srcDir), _TRUNCATE);
             // Sent, not posted: sent messages jump ahead of posted ones, so a posted add could
             // arrive after this op's remove and leave the UI holding freed memory.
             SendMessageW(gMgr, WM_FC_ADD, 0, (LPARAM)o);

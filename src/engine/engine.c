@@ -34,21 +34,47 @@ typedef struct {
     WCHAR firstConf[MAX_PATH];
 } Plan;
 
+// Paths this long (or longer) get the \\?\ prefix so Windows lifts the 260-character limit. The margin
+// below MAX_PATH leaves room for "name (2)" and for folders, whose own limit is 248.
+#define LONG_PATH 240
+
+static BOOL IsExt(PCWSTR p)
+{
+    return !wcsncmp(p, L"\\\\?\\", 4);
+}
+
+static PCWSTR Plain(PCWSTR p)
+{
+    return IsExt(p) ? p + 4 : p;
+}
+
+static PWSTR Ext(PCWSTR p)
+{
+    size_t l = wcslen(p), cap = l + 5;
+    PWSTR r = malloc(cap * sizeof(WCHAR));
+    r[0] = 0;
+    if (l >= LONG_PATH && !IsExt(p))
+        wcscpy_s(r, cap, L"\\\\?\\");
+    wcscat_s(r, cap, p);
+    return r;
+}
+
 static PWSTR Join(PCWSTR a, PCWSTR b)
 {
     size_t la = wcslen(a), cap = la + wcslen(b) + 2;
-    PWSTR r = malloc(cap * sizeof(WCHAR));
-    wcscpy_s(r, cap, a);
+    PWSTR t = malloc(cap * sizeof(WCHAR));
+    wcscpy_s(t, cap, a);
     if (la && a[la - 1] != L'\\')
-        wcscat_s(r, cap, L"\\");
-    wcscat_s(r, cap, b);
+        wcscat_s(t, cap, L"\\");
+    wcscat_s(t, cap, b);
+    PWSTR r = Ext(t);
+    free(t);
     return r;
 }
 
 static BOOL Push(Plan *p, int kind, BOOL fromMove, PCWSTR src, PCWSTR dst, ULONGLONG size)
 {
-    // shortcut: paths >= MAX_PATH fall back to Windows; add \\?\ handling if that shows up in real use.
-    if (wcslen(src) >= MAX_PATH || wcslen(dst) >= MAX_PATH) {
+    if (wcslen(src) >= 32000 || wcslen(dst) >= 32000) {  // the \\?\ limit is 32767
         FcLog(L"fallback: path too long %s", src);
         return FALSE;
     }
@@ -74,7 +100,7 @@ static BOOL Push(Plan *p, int kind, BOOL fromMove, PCWSTR src, PCWSTR dst, ULONG
         } else {
             j->conflict = TRUE;
             if (!p->nconf++)
-                wcscpy_s(p->firstConf, MAX_PATH, dst);
+                wcsncpy_s(p->firstConf, MAX_PATH, Plain(dst), _TRUNCATE);
         }
     }
     j->src = _wcsdup(src);
@@ -122,7 +148,8 @@ static BOOL IsDrivePath(PCWSTR p)
 static BOOL SameVolume(PCWSTR a, PCWSTR b)
 {
     WCHAR va[MAX_PATH], vb[MAX_PATH];
-    return GetVolumePathNameW(a, va, MAX_PATH) && GetVolumePathNameW(b, vb, MAX_PATH) && !_wcsicmp(va, vb);
+    return GetVolumePathNameW(a, va, MAX_PATH) && GetVolumePathNameW(b, vb, MAX_PATH) &&
+           !_wcsicmp(Plain(va), Plain(vb));
 }
 
 static BOOL PlanItem(Plan *p, const FcItem *it, FcProgress *prog)
@@ -132,31 +159,33 @@ static BOOL PlanItem(Plan *p, const FcItem *it, FcProgress *prog)
         return FALSE;
     }
     PCWSTR name = it->newName && *it->newName ? it->newName : PathFindFileNameW(it->src);
-    PWSTR dst = Join(it->dstDir, name);
-    DWORD attr = GetFileAttributesW(it->src);
-    size_t ls = wcslen(it->src);
+    PWSTR dst = Join(it->dstDir, name), src = Ext(it->src), dstDir = Ext(it->dstDir);
+    DWORD attr = GetFileAttributesW(src);
+    size_t ls = wcslen(Plain(src));
     BOOL ok = FALSE;
 
     if (attr == INVALID_FILE_ATTRIBUTES && GetFileAttributesW(dst) != INVALID_FILE_ATTRIBUTES) {
         FcLog(L"fallback: target exists %s", dst);
-    } else if (!_wcsicmp(it->src, dst)) {
+    } else if (!_wcsicmp(Plain(src), Plain(dst))) {
         FcLog(L"fallback: copy onto itself %s", dst);  // Windows makes "name - Copia"
-    } else if (GetFileAttributesW(dst) != INVALID_FILE_ATTRIBUTES && it->move && SameVolume(it->src, it->dstDir)) {
+    } else if (GetFileAttributesW(dst) != INVALID_FILE_ATTRIBUTES && it->move && SameVolume(src, dstDir)) {
         FcLog(L"fallback: target exists %s", dst);  // same-volume move onto an existing name
     } else if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
-        FcLog(L"fallback: source missing or reparse point %s", it->src);
-    } else if ((attr & FILE_ATTRIBUTE_DIRECTORY) && !_wcsnicmp(dst, it->src, ls) && dst[ls] == L'\\') {
+        FcLog(L"fallback: source missing or reparse point %s", src);
+    } else if ((attr & FILE_ATTRIBUTE_DIRECTORY) && !_wcsnicmp(Plain(dst), Plain(src), ls) && Plain(dst)[ls] == L'\\') {
         FcLog(L"fallback: destination inside source %s", dst);
-    } else if (it->move && SameVolume(it->src, it->dstDir)) {
-        ok = Push(p, J_RENAME, TRUE, it->src, dst, 0);
+    } else if (it->move && SameVolume(src, dstDir)) {
+        ok = Push(p, J_RENAME, TRUE, src, dst, 0);
     } else if (attr & FILE_ATTRIBUTE_DIRECTORY) {
-        ok = Push(p, J_MKDIR, it->move, it->src, dst, 0) && PlanDir(p, it->src, dst, it->move, prog);
+        ok = Push(p, J_MKDIR, it->move, src, dst, 0) && PlanDir(p, src, dst, it->move, prog);
     } else {
         WIN32_FILE_ATTRIBUTE_DATA fa;
-        ok = GetFileAttributesExW(it->src, GetFileExInfoStandard, &fa) &&
-             Push(p, J_COPY, it->move, it->src, dst, ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
+        ok = GetFileAttributesExW(src, GetFileExInfoStandard, &fa) &&
+             Push(p, J_COPY, it->move, src, dst, ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
     }
     free(dst);
+    free(src);
+    free(dstDir);
     return ok;
 }
 
@@ -210,7 +239,7 @@ static BOOL WaitIfPaused(FcProgress *prog)
 static void SetCurrent(FcProgress *prog, PCWSTR path)
 {
     AcquireSRWLockExclusive(&prog->lock);
-    wcscpy_s(prog->current, MAX_PATH, path);
+    wcsncpy_s(prog->current, MAX_PATH, Plain(path), _TRUNCATE);
     ReleaseSRWLockExclusive(&prog->lock);
 }
 
@@ -376,7 +405,7 @@ static void Notify(const FcItem *items, int n)
     for (int i = 0; i < n; i++) {
         if (i == 0 || _wcsicmp(items[i].dstDir, items[i - 1].dstDir))
             SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, items[i].dstDir, NULL);
-        if (items[i].move) {
+        if (items[i].move && wcslen(items[i].src) < MAX_PATH) {
             WCHAR parent[MAX_PATH];
             wcscpy_s(parent, MAX_PATH, items[i].src);
             PathRemoveFileSpecW(parent);
@@ -415,7 +444,10 @@ FcResult FcRun(const FcItem *items, int n, FcProgress *prog)
         }
     // shortcut: assumes all items share one destination volume (true for Explorer drops/pastes).
     ULARGE_INTEGER freeBytes;
-    if (bytes && (!GetDiskFreeSpaceExW(items[0].dstDir, &freeBytes, NULL, NULL) || freeBytes.QuadPart < bytes)) {
+    PWSTR dstDirExt = Ext(items[0].dstDir);
+    BOOL noSpace = bytes && (!GetDiskFreeSpaceExW(dstDirExt, &freeBytes, NULL, NULL) || freeBytes.QuadPart < bytes);
+    free(dstDirExt);
+    if (noSpace) {
         FcLog(L"fallback: not enough free space for %llu bytes", bytes);
         goto out;
     }

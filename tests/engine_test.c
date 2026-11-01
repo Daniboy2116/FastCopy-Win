@@ -165,10 +165,47 @@ static void RunSuite(PCWSTR root, PCWSTR otherRoot)
     CHECK(FcRun(&self, 1, Reset(&pr)) == FC_FALLBACK);
 }
 
+static void Nuke(PCWSTR dir);
+
+// Folders nested past MAX_PATH: copy, then move (copy + verify + delete the source).
+static void LongSuite(PCWSTR root)
+{
+    WCHAR deep[1024], p[1024], dst[MAX_PATH], q[1024];
+    FcProgress pr;
+    swprintf_s(deep, _countof(deep), L"\\\\?\\%s\\longsrc", root);
+    CreateDirectoryW(deep, NULL);
+    for (int i = 0; i < 8; i++) {
+        wcscat_s(deep, _countof(deep), L"\\0123456789012345678901234567890123456789");
+        CreateDirectoryW(deep, NULL);
+    }
+    swprintf_s(p, _countof(p), L"%s\\leaf.txt", deep);
+    WriteFileText(p, "long path file", 4096);
+    CHECK(wcslen(deep) > MAX_PATH);
+    swprintf_s(dst, MAX_PATH, L"%s\\longdst", root);
+    CreateDirectoryW(dst, NULL);
+
+    swprintf_s(p, _countof(p), L"%s\\longsrc", root);
+    FcItem copy = { FALSE, p, dst, NULL };
+    CHECK(FcRun(&copy, 1, Reset(&pr)) == FC_OK && pr.filesDone == 1);
+    swprintf_s(q, _countof(q), L"\\\\?\\%s%s\\leaf.txt", dst, deep + 4 + wcslen(root));
+    swprintf_s(p, _countof(p), L"%s\\leaf.txt", deep);
+    CHECK(Exists(q) && SameContent(p, q));
+
+    Nuke(dst);  // clear the copy, then move
+    CreateDirectoryW(dst, NULL);
+    swprintf_s(p, _countof(p), L"%s\\longsrc", root);
+    FcItem move = { TRUE, p, dst, NULL };
+    CHECK(FcRun(&move, 1, Reset(&pr)) == FC_OK);
+    swprintf_s(p, _countof(p), L"\\\\?\\%s\\longsrc", root);
+    CHECK(!Exists(p));
+    CHECK(Exists(q));
+}
+
 static void Nuke(PCWSTR dir)
 {
     WCHAR cmd[MAX_PATH + 32];
-    swprintf_s(cmd, _countof(cmd), L"cmd /c attrib -r \"%s\\*\" /s /d >nul & rd /s /q \"%s\"", dir, dir);
+    // \\?\ so folders nested past MAX_PATH go too
+    swprintf_s(cmd, _countof(cmd), L"cmd /c attrib -r \"\\\\?\\%s\\*\" /s /d >nul & rd /s /q \"\\\\?\\%s\"", dir, dir);
     _wsystem(cmd);
 }
 
@@ -187,6 +224,10 @@ int wmain(void)
     CreateDirectoryW(root, NULL);
     BuildTree(root);
     ConflictSuite(root, root);
+    Nuke(root);
+
+    CreateDirectoryW(root, NULL);
+    LongSuite(root);
     Nuke(root);
 
     if (GetDriveTypeW(L"D:\\") == DRIVE_FIXED) {
