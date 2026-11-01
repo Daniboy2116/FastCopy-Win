@@ -1,6 +1,6 @@
 # FastCopy-Win
 
-Motor de copia y movimiento de archivos propio para el **Explorador de Windows 11**, que reemplaza al de Windows sin cambiar cómo lo usas: arrastrar, `Ctrl+C`, `Ctrl+X`, `Ctrl+V` y el menú contextual siguen funcionando igual, pero la copia la hace FastCopy.
+Motor de copia y movimiento de archivos propio para el **Explorador de Windows** (11, y 10 sin probar), que reemplaza al de Windows sin cambiar cómo lo usas: arrastrar, `Ctrl+C`, `Ctrl+X`, `Ctrl+V` y el menú contextual siguen funcionando igual, pero la copia la hace FastCopy.
 
 > **Estado: experimental.** Funciona y está probado en una sola máquina (Windows 11 IoT Enterprise LTSC 2024, build 26100.6713). Úsalo bajo tu propia responsabilidad y lee la sección [Riesgos](#riesgos).
 
@@ -58,10 +58,27 @@ Ambas copias con el origen en caché y verificadas: mismos archivos y mismos byt
 3. Cuando el Explorador pide ejecutar (`PerformOperations`), FastCopy hace la copia con su motor y le responde "hecho". Si la operación no es de las que maneja, llama al `PerformOperations` original y copia Windows.
 4. `fc_agent.exe` corre con tu usuario (una tarea programada al iniciar sesión) y se asegura de que la DLL esté cargada en el Explorador, también después de reiniciarlo.
 
+## Compatibilidad
+
+FastCopy engancha `IFileOperation`, una interfaz pública que el Explorador usa para copiar y mover desde Windows Vista, así que no depende de una versión concreta. Aun así, **solo está probado en Windows 11 24H2**; el resto de la tabla sale de revisar el código y la documentación de Microsoft.
+
+| Sistema | Estado |
+|---|---|
+| Windows 11 24H2 (build 26100), x64 | ✅ Probado |
+| Windows 11 21H2, 22H2, 23H2 y 25H2, x64 | 🟡 Debería funcionar, sin probar |
+| Windows 11 Insider (26H2) | 🟡 Sin probar. Microsoft está rediseñando el diálogo de copia; FastCopy lo sustituye, pero un cambio en el motor del Explorador podría saltárselo |
+| Windows 10 1809 a 22H2, x64 | 🟡 Debería funcionar, sin probar (iconos y barra de título oscura adaptados) |
+| Windows Server 2019, 2022 y 2025 con experiencia de escritorio | 🟡 Debería funcionar, sin probar (misma base que Windows 10 / 11) |
+| Windows Server Core | ❌ No tiene Explorador |
+| Windows en ARM (ARM64) | ❌ No funciona: MinHook no soporta ARM64. Haría falta cambiarlo por [Microsoft Detours](https://github.com/microsoft/Detours) y compilar para ARM64 |
+| Smart App Control en modo "Activado" | ❌ Bloquea la DLL porque no está firmada. En modo "Evaluación" o desactivado funciona |
+| Windows de 32 bits | ❌ No se compila para x86 |
+
+Si lo pruebas en otra versión, abre un issue contando cómo fue (y adjunta `%TEMP%\fastcopy.log`).
+
 ## Requisitos
 
-- Windows 10 (1809 o posterior) u 11, x64, con Explorador (también Windows Server 2019/2022/2025 con experiencia de escritorio). Probado solo en Windows 11 24H2 (build 26100); en el resto debería funcionar porque usa una interfaz pública, pero no está probado.
-- No funciona en Windows en ARM (MinHook no soporta ARM64) ni con Smart App Control en modo "Activado" (bloquea DLL sin firmar).
+- Una versión compatible de la tabla anterior.
 - Para compilar: Visual Studio 2022 Build Tools con el componente de C++ (MSVC) y el Windows SDK.
 - Permisos de administrador solo para instalar (copiar a `Program Files`).
 
@@ -163,3 +180,6 @@ uninstall.ps1      lo quita todo
 - Rutas de más de 260 caracteres (ahora las copia Windows).
 - Decidir archivo por archivo en los conflictos (ahora es una respuesta para toda la operación).
 - Verificación también en copias (ahora solo se verifica al mover).
+- Probar en Windows 10 y en otras versiones de Windows 11 (ver [Compatibilidad](#compatibilidad)).
+- Soporte para ARM64 (cambiar MinHook por Detours).
+- Firmar los binarios, para que Smart App Control y los antivirus no los bloqueen.
